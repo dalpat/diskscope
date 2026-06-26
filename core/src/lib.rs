@@ -8,4 +8,5 @@
 pub mod category;
 pub mod disk;
 pub mod format;
+pub mod reclaim;
 pub mod scan;
