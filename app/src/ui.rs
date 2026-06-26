@@ -95,10 +95,18 @@ struct Ui {
     list: gtk::ListBox,
 }
 
-/// An action invoked from a row's trailing buttons.
+/// An action invoked from a row's trailing buttons or right-click menu.
 #[derive(Clone, Copy)]
 enum RowAction {
+    /// Open with the desktop's default handler.
     Open,
+    /// Reveal in the file manager (open the containing folder, item selected).
+    Reveal,
+    /// Open a terminal at the item's folder.
+    Terminal,
+    /// Copy the item's absolute path to the clipboard.
+    CopyPath,
+    /// Move to Trash (after confirmation).
     Trash,
 }
 
@@ -631,7 +639,8 @@ fn render_category(root: &Node, category: Category, state: &Rc<RefCell<AppState>
         ui.list.append(&placeholder_row(&format!("No {} found.", category.label().to_lowercase())));
     }
     for file in files.iter().take(SHOWN) {
-        ui.list.append(&build_row(file, total, Some(&handler)));
+        let location = file_location(&root.path, &file.path);
+        ui.list.append(&build_row(file, total, Some(&location), Some(&handler)));
     }
     if files.len() > SHOWN {
         ui.list.append(&placeholder_row(&format!("…and {} more files", files.len() - SHOWN)));
@@ -651,18 +660,91 @@ fn render_folder(root: &Node, path: &[usize], state: &Rc<RefCell<AppState>>, ui:
     populate(&ui.list, node, Some(&handler));
 
     ui.title.set_title(&node.name);
-    ui.title.set_subtitle(&human_size(node.size));
+    // Show the absolute path so it's always clear where you are.
+    ui.title.set_subtitle(&node.path.display().to_string());
     ui.stack.set_visible_child_name("list");
 }
 
-/// Build the dispatcher for per-row Open / Trash buttons.
+/// A short label for where a file lives: its parent folder shown relative to the
+/// scanned root (prefixed with the root's name), or the absolute parent path if
+/// it lies outside the root.
+fn file_location(root: &Path, file: &Path) -> String {
+    let parent = file.parent().unwrap_or(file);
+    let Ok(rel) = parent.strip_prefix(root) else {
+        return parent.display().to_string();
+    };
+    let root_name = root
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| root.display().to_string());
+    if rel.as_os_str().is_empty() {
+        root_name
+    } else {
+        format!("{root_name}/{}", rel.display())
+    }
+}
+
+/// Build the dispatcher for per-row actions (trailing buttons + context menu).
 fn row_action_handler(state: &Rc<RefCell<AppState>>, ui: &Rc<Ui>) -> Rc<dyn Fn(RowAction, PathBuf)> {
     let state = state.clone();
     let ui = ui.clone();
     Rc::new(move |action, path| match action {
         RowAction::Open => open_path(&path, &ui),
+        RowAction::Reveal => reveal_path(&path, &ui),
+        RowAction::Terminal => open_terminal(&path, &ui),
+        RowAction::CopyPath => copy_path(&path, &ui),
         RowAction::Trash => confirm_and_trash(path, &state, &ui),
     })
+}
+
+/// Attach a right-click context menu to `row`, dispatching through `handler`.
+///
+/// The menu items map to `app`-less per-row actions installed in a "row" action
+/// group on the row itself, so each row carries its own path.
+fn attach_context_menu(row: &gtk::ListBoxRow, path: &Path, handler: &Rc<dyn Fn(RowAction, PathBuf)>) {
+    let menu = gio::Menu::new();
+    menu.append(Some("Open"), Some("row.open"));
+    menu.append(Some("Open Containing Folder"), Some("row.reveal"));
+    menu.append(Some("Open Terminal Here"), Some("row.terminal"));
+    menu.append(Some("Copy Full Path"), Some("row.copy-path"));
+    let trash_section = gio::Menu::new();
+    trash_section.append(Some("Move to Trash"), Some("row.trash"));
+    menu.append_section(None, &trash_section);
+
+    let actions = gio::SimpleActionGroup::new();
+    for (name, action) in [
+        ("open", RowAction::Open),
+        ("reveal", RowAction::Reveal),
+        ("terminal", RowAction::Terminal),
+        ("copy-path", RowAction::CopyPath),
+        ("trash", RowAction::Trash),
+    ] {
+        let item = gio::SimpleAction::new(name, None);
+        let handler = handler.clone();
+        let path = path.to_path_buf();
+        item.connect_activate(move |_, _| handler(action, path.clone()));
+        actions.add_action(&item);
+    }
+    row.insert_action_group("row", Some(&actions));
+
+    // Secondary (right) click pops the menu up at the pointer.
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(gtk::gdk::BUTTON_SECONDARY);
+    let row_weak = row.downgrade();
+    gesture.connect_pressed(move |gesture, _, x, y| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        let Some(row) = row_weak.upgrade() else {
+            return;
+        };
+        let popover = gtk::PopoverMenu::from_model(Some(&menu));
+        popover.set_parent(&row);
+        popover.set_has_arrow(false);
+        popover.set_halign(gtk::Align::Start);
+        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover.connect_closed(|popover| popover.unparent());
+        popover.popup();
+    });
+    row.add_controller(gesture);
 }
 
 /// Rebuild the clickable breadcrumb: a home icon, then root → current folder.
@@ -720,18 +802,20 @@ fn populate(list: &gtk::ListBox, node: &Node, handler: Option<&Rc<dyn Fn(RowActi
     clear(list);
     let total = node.size.max(1);
     for child in &node.children {
-        list.append(&build_row(child, total, handler));
+        list.append(&build_row(child, total, None, handler));
     }
     if node.children.is_empty() {
         list.append(&placeholder_row("This folder is empty."));
     }
 }
 
-/// One file/folder row: icon, name, colour-coded bar, size, percentage, and
-/// (when `handler` is set) Open / Trash buttons.
+/// One file/folder row: icon, name (optionally over a `location` line), a
+/// colour-coded bar, size, percentage, and — when `handler` is set — hover
+/// Open / Trash buttons plus a right-click context menu.
 fn build_row(
     node: &Node,
     total: u64,
+    location: Option<&str>,
     handler: Option<&Rc<dyn Fn(RowAction, PathBuf)>>,
 ) -> gtk::ListBoxRow {
     let fraction = node.size as f64 / total as f64;
@@ -746,9 +830,25 @@ fn build_row(
     let name = gtk::Label::builder()
         .label(&node.name)
         .xalign(0.0)
-        .hexpand(true)
         .ellipsize(gtk::pango::EllipsizeMode::Middle)
         .build();
+
+    // Filename, optionally over a dim "where it lives" line — used in category
+    // lists, where files can come from anywhere in the tree.
+    let name_area = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    name_area.set_hexpand(true);
+    name_area.set_valign(gtk::Align::Center);
+    name_area.append(&name);
+    if let Some(location) = location {
+        let loc = gtk::Label::builder()
+            .label(location)
+            .xalign(0.0)
+            .ellipsize(gtk::pango::EllipsizeMode::Start)
+            .build();
+        loc.add_css_class("dim-label");
+        loc.add_css_class("caption");
+        name_area.append(&loc);
+    }
 
     let bar = gtk::ProgressBar::builder()
         .fraction(fraction)
@@ -774,7 +874,7 @@ fn build_row(
         .margin_bottom(8)
         .build();
     row_box.append(&icon);
-    row_box.append(&name);
+    row_box.append(&name_area);
     row_box.append(&bar);
     row_box.append(&size);
     row_box.append(&percent_label);
@@ -806,6 +906,12 @@ fn build_row(
     let row = gtk::ListBoxRow::new();
     row.set_child(Some(&row_box));
     row.set_activatable(node.is_dir);
+    // The full path on hover answers "where is this?" everywhere.
+    row.set_tooltip_text(Some(&node.path.display().to_string()));
+
+    if let Some(handler) = handler {
+        attach_context_menu(&row, &node.path, handler);
+    }
 
     if let Some(revealer) = revealer {
         let motion = gtk::EventControllerMotion::new();
@@ -1043,6 +1149,52 @@ fn open_path(path: &Path, ui: &Rc<Ui>) {
             ui.toasts.add_toast(adw::Toast::new(&format!("Couldn't open: {err}")));
         }
     });
+}
+
+/// Reveal `path` in the file manager — open its containing folder with the item
+/// selected, so you can see exactly where it lives.
+fn reveal_path(path: &Path, ui: &Rc<Ui>) {
+    let launcher = gtk::FileLauncher::new(Some(&gio::File::for_path(path)));
+    let window = ui.window.clone();
+    let ui = ui.clone();
+    launcher.open_containing_folder(Some(&window), gio::Cancellable::NONE, move |result| {
+        if let Err(err) = result {
+            ui.toasts.add_toast(adw::Toast::new(&format!("Couldn't reveal: {err}")));
+        }
+    });
+}
+
+/// Copy `path`'s absolute location to the clipboard.
+fn copy_path(path: &Path, ui: &Rc<Ui>) {
+    ui.window.clipboard().set_text(&path.to_string_lossy());
+    ui.toasts.add_toast(adw::Toast::new("Path copied to clipboard"));
+}
+
+/// Open a terminal at `path`'s folder (the folder itself if it is a directory,
+/// otherwise its parent), trying common terminal emulators in turn.
+fn open_terminal(path: &Path, ui: &Rc<Ui>) {
+    let dir = if path.is_dir() {
+        path.to_path_buf()
+    } else {
+        path.parent().map(Path::to_path_buf).unwrap_or_else(|| PathBuf::from("/"))
+    };
+    const TERMINALS: [&str; 9] = [
+        "x-terminal-emulator", // Debian/Ubuntu's configured default
+        "gnome-terminal",
+        "kgx", // GNOME Console
+        "konsole",
+        "xfce4-terminal",
+        "kitty",
+        "alacritty",
+        "foot",
+        "xterm",
+    ];
+    for terminal in TERMINALS {
+        if std::process::Command::new(terminal).current_dir(&dir).spawn().is_ok() {
+            return;
+        }
+    }
+    ui.toasts.add_toast(adw::Toast::new("No terminal emulator found"));
 }
 
 /// Confirm, then move `path` to Trash and rescan to reflect freed space.
