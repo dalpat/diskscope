@@ -7,10 +7,10 @@
 //! resulting tree. No mocks, no display server — just the public library API.
 
 use std::fs;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::Path;
 
-use diskscope::scan::{scan, Node};
+use diskscope::scan::{scan, scan_cancellable, CancelFlag, Node};
 use tempfile::tempdir;
 
 /// Write a file of exactly `bytes` bytes at `path`.
@@ -153,6 +153,44 @@ fn hardlinks_are_counted_once() {
     let mut sizes: Vec<u64> = tree.children.iter().map(|c| c.size).collect();
     sizes.sort_unstable();
     assert_eq!(sizes, vec![0, 4000]);
+}
+
+#[test]
+fn cancellable_scan_matches_plain_scan() {
+    // With a fresh (un-cancelled) flag, the parallel cancellable scan must
+    // produce exactly the same tree as the convenience `scan` entry point.
+    let dir = tempdir().unwrap();
+    fixture(dir.path());
+
+    let plain = scan(dir.path()).unwrap();
+    let cancellable = scan_cancellable(dir.path(), &CancelFlag::new()).unwrap();
+
+    assert_eq!(plain, cancellable, "cancellable scan must match the plain scan");
+}
+
+#[test]
+fn already_cancelled_scan_is_interrupted() {
+    // A flag that is already set before the walk begins must abort the scan and
+    // surface an `Interrupted` error rather than returning a partial tree.
+    let dir = tempdir().unwrap();
+    fixture(dir.path());
+
+    let flag = CancelFlag::new();
+    flag.cancel();
+
+    let err = scan_cancellable(dir.path(), &flag).expect_err("cancelled scan should error");
+    assert_eq!(err.kind(), ErrorKind::Interrupted, "cancellation surfaces as Interrupted");
+}
+
+#[test]
+fn cancel_flag_clones_share_state() {
+    // The flag is handed to a worker thread and to the UI as separate clones;
+    // cancelling either clone must be observable through the other.
+    let flag = CancelFlag::new();
+    let worker = flag.clone();
+    assert!(!worker.is_cancelled());
+    flag.cancel();
+    assert!(worker.is_cancelled(), "clones share one cancellation state");
 }
 
 #[cfg(unix)]
