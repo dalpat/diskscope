@@ -26,12 +26,29 @@ From there you can:
 - **Act on what you find**: open any entry in your file manager, or move it to
   the Trash (with a confirmation) — DiskScope rescans automatically to show the
   space you freed.
+- **Free up space** — a one-tap view of what's safe to clear *without losing
+  important files*: your **Trash**, your **app caches**, and regenerable
+  **project artifacts** found in the scanned tree (`node_modules`, Rust
+  `target/`, `__pycache__`, …). Caches are broken out **per application** (with
+  friendly names) — never offered as one giant "delete all of `~/.cache`" item,
+  so you decide app by app. Every entry shows its **blast radius — what breaks if
+  you delete it**: a colour-coded risk badge (**Safe** / **Rebuilds** / **Check
+  first**) and a plain sentence on the consequence — e.g. a browser cache is
+  *"Safe — re-downloads cached pages; bookmarks, history and logins live elsewhere
+  and aren't touched,"* `node_modules` is *"Rebuilds — won't build until you
+  reinstall (needs internet),"* and an unrecognised cache is flagged *"Check
+  first."* The same assessment is repeated in the confirmation before anything is
+  removed. Clearing **moves to Trash by default** (reversible); flip the **Delete
+  permanently** switch — or use an item's right-click menu — to remove it for good
+  and reclaim the space immediately.
 - **Refresh** to rescan, or open a different folder entirely.
 
 Categories are inferred from file extensions. Symlinks are never followed and
-hardlinked files are counted only once, so nothing is double-counted. No
-database, no settings, no daemon (YAGNI) — just answer "where did my space go?"
-and let you fix it.
+hardlinked files are counted only once, so nothing is double-counted. Generic
+build-dir names (`target`, `build`, `dist`) are only flagged when a marker file
+(`Cargo.toml`, `package.json`) proves they belong to a known tool, so a folder
+you happen to call "build" is never mistaken for junk. No database, no settings,
+no daemon (YAGNI) — just answer "where did my space go?" and let you fix it.
 
 ## Architecture
 
@@ -42,6 +59,7 @@ A two-crate workspace splits the pure logic from the GUI:
 | `core/src/scan.rs` | The scan engine — walks the tree, totals sizes, sorts. **No GTK.** |
 | `core/src/category.rs` | Classifies files into categories and aggregates per-category usage. **No GTK.** |
 | `core/src/disk.rs` | Whole-filesystem capacity (total/free) via `statvfs`. **No GTK.** |
+| `core/src/reclaim.rs` | Finds safe-to-clear space: system spots (Trash, caches) + regenerable project artifacts. **No GTK.** |
 | `core/src/format.rs` | Byte → human-readable formatting. **No GTK.** |
 | `core/src/lib.rs` | The `diskscope` library (re-exports the modules above). |
 | `core/tests/scan_e2e.rs` | End-to-end tests over real temporary directory trees. |
@@ -69,6 +87,25 @@ cargo run -p diskscope -- ~/Downloads  # launch and scan a folder immediately
 cargo build --release
 ```
 
+### Install as a desktop app
+
+To launch DiskScope from the GNOME Activities Overview / app grid (instead of
+`cargo run`), install it for your user:
+
+```sh
+./install.sh             # build in release + install the launcher and icon
+./install.sh --uninstall # remove them again
+```
+
+This builds the release binary and drops it, a `.desktop` launcher, and the app
+icon under your per-user XDG directories (`~/.local/bin`,
+`~/.local/share/applications`, `~/.local/share/icons`) — no root required. The
+launcher uses the app's own ID (`dev.diskscope.DiskScope`) so GNOME pairs the
+window with the icon, and registers DiskScope as a folder handler, so you can
+also right-click a folder in Files → *Open With* → DiskScope. Then just search
+"DiskScope" in the overview. (The script sources `env.sh` if present, so the
+user-local dev-libraries setup below works automatically.)
+
 ### No root? (user-local dev libraries)
 
 If you can't `sudo` but the GTK/libadwaita **runtime** is already installed,
@@ -79,7 +116,7 @@ builds against the system runtime with no root access.
 ## Test
 
 ```sh
-cargo test                     # whole workspace (22 tests)
+cargo test                     # whole workspace (32 tests)
 cargo test -p diskscope-core   # just the engine — needs no GTK at all
 ```
 

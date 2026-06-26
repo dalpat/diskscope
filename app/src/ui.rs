@@ -1,12 +1,14 @@
 //! GTK4 + libadwaita front-end. A thin, stateful view over the scan engine.
 //!
-//! Three views, dispatched by [`render`]:
+//! Views, dispatched by [`render`]:
 //! - **Overview** — the Android-style storage homepage: a segmented usage bar
 //!   plus a list of categories (Videos, Audio, …).
 //! - **Category** — the largest files of one category, with Open / Trash.
 //! - **Folder** — the classic directory tree browser with a breadcrumb.
+//! - **Reclaim** — safe-to-clear space: Trash, caches, and regenerable project
+//!   artifacts found in the scanned tree.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -16,6 +18,7 @@ use gtk::{gio, glib};
 use diskscope::category::{self, Category};
 use diskscope::disk::{self, DiskUsage};
 use diskscope::format::human_size;
+use diskscope::reclaim::{self, ReclaimKind, Reclaimable, Risk};
 use diskscope::scan::{self, Node};
 
 /// Theme additions: heat-map usage bars, category accent colours, crumb styling.
@@ -39,6 +42,9 @@ progressbar.bucket-1 > trough > progress { background-color: #3584e4; }
 .cat-code { color: #2ec27e; }
 .cat-applications { color: #e5a50a; }
 .cat-other { color: #77767b; }
+.risk-safe { color: #2ec27e; font-weight: bold; }
+.risk-rebuild { color: #e5a50a; font-weight: bold; }
+.risk-caution { color: #e01b24; font-weight: bold; }
 ";
 
 /// Which screen the user is on.
@@ -47,6 +53,7 @@ enum View {
     Overview,
     Category(Category),
     Folder(Vec<usize>), // drill-down path of child indices from the root
+    Reclaim,            // safe-to-clear space (Trash, caches, build artifacts)
 }
 
 /// What the user is currently looking at.
@@ -54,11 +61,16 @@ struct AppState {
     /// The scanned tree, or `None` before the first scan.
     root: Option<Node>,
     view: View,
+    /// Reclaim view: when true the row's primary "clear" action deletes
+    /// permanently instead of moving to Trash. Session-only (no persisted
+    /// settings — see the project's YAGNI stance). Permanent delete is also
+    /// always available per-row via the right-click menu.
+    reclaim_perm_delete: bool,
 }
 
 impl Default for AppState {
     fn default() -> Self {
-        AppState { root: None, view: View::Overview }
+        AppState { root: None, view: View::Overview, reclaim_perm_delete: false }
     }
 }
 
@@ -94,10 +106,23 @@ struct Ui {
     // Shared list page (folder + category).
     crumbs: gtk::Box,
     list: gtk::ListBox,
+    // Reclaim page.
+    reclaim_total: gtk::Label,
+    reclaim_perm_switch: gtk::Switch,
+    reclaim_system_caption: gtk::Label,
+    reclaim_system_list: gtk::ListBox,
+    reclaim_artifact_caption: gtk::Label,
+    reclaim_artifact_list: gtk::ListBox,
+    /// Last measured spots, kept so toggling the delete-mode switch can rebuild
+    /// the rows without a rescan. `(system, artifacts)`.
+    reclaim_data: Rc<RefCell<(Vec<Reclaimable>, Vec<Reclaimable>)>>,
+    /// Generation guard: a stale background measurement (from a superseded
+    /// entry into the view) is dropped instead of overwriting fresh results.
+    reclaim_gen: Rc<Cell<u64>>,
 }
 
 /// An action invoked from a row's trailing buttons or right-click menu.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum RowAction {
     /// Open with the desktop's default handler.
     Open,
@@ -109,6 +134,8 @@ enum RowAction {
     CopyPath,
     /// Move to Trash (after confirmation).
     Trash,
+    /// Permanently delete (after confirmation). Used by the Reclaim view.
+    Delete,
 }
 
 /// Build and present the main window. Wired as the application's `activate`.
@@ -220,9 +247,20 @@ pub fn build_ui(app: &adw::Application, initial: Option<String>) {
     overview_list.set_margin_top(6);
 
     let browse_button = gtk::Button::with_label("Browse all folders");
-    browse_button.set_halign(gtk::Align::Center);
-    browse_button.set_margin_top(6);
     browse_button.add_css_class("pill");
+
+    let reclaim_button = gtk::Button::builder()
+        .icon_name("user-trash-symbolic")
+        .label("Free up space")
+        .build();
+    reclaim_button.add_css_class("pill");
+    reclaim_button.add_css_class("suggested-action");
+
+    let overview_buttons = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    overview_buttons.set_halign(gtk::Align::Center);
+    overview_buttons.set_margin_top(6);
+    overview_buttons.append(&browse_button);
+    overview_buttons.append(&reclaim_button);
 
     // Anchor the bar/legend/list to "this folder", contrasting the ring's
     // whole-disk reading so the two aren't conflated.
@@ -241,7 +279,7 @@ pub fn build_ui(app: &adw::Application, initial: Option<String>) {
     overview_inner.append(&overview_bar);
     overview_inner.append(&legend);
     overview_inner.append(&overview_list);
-    overview_inner.append(&browse_button);
+    overview_inner.append(&overview_buttons);
 
     let overview = gtk::ScrolledWindow::builder()
         .vexpand(true)
@@ -283,12 +321,87 @@ pub fn build_ui(app: &adw::Application, initial: Option<String>) {
     list_page.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     list_page.append(&list_scroller);
 
+    // --- Reclaim page ------------------------------------------------------
+    let reclaim_total = gtk::Label::builder().xalign(0.0).label("—").build();
+    reclaim_total.add_css_class("title-1");
+    let reclaim_caption =
+        gtk::Label::builder().xalign(0.0).label("Reclaimable space").build();
+    reclaim_caption.add_css_class("dim-label");
+    let reclaim_head = gtk::Box::new(gtk::Orientation::Vertical, 2);
+    reclaim_head.set_hexpand(true);
+    reclaim_head.append(&reclaim_total);
+    reclaim_head.append(&reclaim_caption);
+
+    // The "setting": flip the primary clear action from Trash to permanent.
+    let reclaim_perm_switch = gtk::Switch::new();
+    reclaim_perm_switch.set_valign(gtk::Align::Center);
+    let perm_label = gtk::Label::new(Some("Delete permanently"));
+    let perm_box = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    perm_box.set_valign(gtk::Align::Center);
+    perm_box.append(&perm_label);
+    perm_box.append(&reclaim_perm_switch);
+    perm_box.set_tooltip_text(Some(
+        "When on, the clear button deletes for good instead of moving to Trash.\n\
+         Permanent delete is always available per item via right-click.",
+    ));
+
+    let reclaim_top = gtk::Box::new(gtk::Orientation::Horizontal, 12);
+    reclaim_top.append(&reclaim_head);
+    reclaim_top.append(&perm_box);
+
+    let reclaim_hint = gtk::Label::builder()
+        .xalign(0.0)
+        .wrap(true)
+        .label(
+            "Each item shows what happens if you remove it. Most rebuild \
+             automatically — give anything marked “Check first” a second look. \
+             Moving to Trash is reversible; space is freed once the Trash is emptied.",
+        )
+        .build();
+    reclaim_hint.add_css_class("dim-label");
+    reclaim_hint.add_css_class("caption");
+
+    let reclaim_system_caption =
+        gtk::Label::builder().xalign(0.0).label("Safe to clear").build();
+    reclaim_system_caption.add_css_class("dim-label");
+    reclaim_system_caption.add_css_class("caption");
+    let reclaim_system_list =
+        gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).build();
+    reclaim_system_list.add_css_class("boxed-list");
+
+    let reclaim_artifact_caption =
+        gtk::Label::builder().xalign(0.0).label("Regenerable in this folder").build();
+    reclaim_artifact_caption.add_css_class("dim-label");
+    reclaim_artifact_caption.add_css_class("caption");
+    let reclaim_artifact_list =
+        gtk::ListBox::builder().selection_mode(gtk::SelectionMode::None).build();
+    reclaim_artifact_list.add_css_class("boxed-list");
+
+    let reclaim_inner = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    reclaim_inner.set_margin_top(18);
+    reclaim_inner.set_margin_bottom(18);
+    reclaim_inner.set_margin_start(12);
+    reclaim_inner.set_margin_end(12);
+    reclaim_inner.append(&reclaim_top);
+    reclaim_inner.append(&reclaim_hint);
+    reclaim_inner.append(&reclaim_system_caption);
+    reclaim_inner.append(&reclaim_system_list);
+    reclaim_inner.append(&reclaim_artifact_caption);
+    reclaim_inner.append(&reclaim_artifact_list);
+
+    let reclaim_page = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&adw::Clamp::builder().maximum_size(700).child(&reclaim_inner).build())
+        .build();
+
     // --- Stack --------------------------------------------------------------
     let stack = gtk::Stack::new();
     stack.add_named(&empty, Some("empty"));
     stack.add_named(&scanning, Some("scanning"));
     stack.add_named(&overview, Some("overview"));
     stack.add_named(&list_page, Some("list"));
+    stack.add_named(&reclaim_page, Some("reclaim"));
     stack.set_visible_child_name("empty");
 
     let toasts = adw::ToastOverlay::new();
@@ -325,6 +438,14 @@ pub fn build_ui(app: &adw::Application, initial: Option<String>) {
         overview_data,
         crumbs,
         list: list.clone(),
+        reclaim_total,
+        reclaim_perm_switch: reclaim_perm_switch.clone(),
+        reclaim_system_caption,
+        reclaim_system_list: reclaim_system_list.clone(),
+        reclaim_artifact_caption,
+        reclaim_artifact_list: reclaim_artifact_list.clone(),
+        reclaim_data: Rc::new(RefCell::new((Vec::new(), Vec::new()))),
+        reclaim_gen: Rc::new(Cell::new(0)),
     });
 
     // --- Wiring -------------------------------------------------------------
@@ -351,6 +472,22 @@ pub fn build_ui(app: &adw::Application, initial: Option<String>) {
         state.borrow_mut().view = View::Folder(Vec::new());
         render(state, ui);
     });
+    connect(&reclaim_button, &state, &ui, |state, ui| {
+        state.borrow_mut().view = View::Reclaim;
+        render(state, ui);
+    });
+
+    // Delete-mode switch: rebuild the reclaim rows so each primary action button
+    // reflects the new mode immediately (no rescan needed).
+    {
+        let state = state.clone();
+        let ui = ui.clone();
+        reclaim_perm_switch.connect_active_notify(move |sw| {
+            let perm = sw.is_active();
+            state.borrow_mut().reclaim_perm_delete = perm;
+            populate_reclaim_lists(&state, &ui, perm);
+        });
+    }
 
     // Overview category row → open that category.
     {
@@ -569,6 +706,7 @@ fn render(state: &Rc<RefCell<AppState>>, ui: &Rc<Ui>) {
         View::Overview => render_overview(root, ui),
         View::Category(category) => render_category(root, *category, state, ui),
         View::Folder(path) => render_folder(root, path, state, ui),
+        View::Reclaim => render_reclaim(root, state, ui, s.reclaim_perm_delete),
     }
 }
 
@@ -666,6 +804,313 @@ fn render_folder(root: &Node, path: &[usize], state: &Rc<RefCell<AppState>>, ui:
     ui.stack.set_visible_child_name("list");
 }
 
+/// The "free up space" view: regenerable artifacts in the scanned tree (computed
+/// instantly from the in-memory tree) plus the system safe spots (Trash, caches)
+/// measured on a worker thread. Shows the spinner while measuring, then the page.
+fn render_reclaim(root: &Node, state: &Rc<RefCell<AppState>>, ui: &Rc<Ui>, perm: bool) {
+    ui.title.set_title("Free up space");
+    ui.title.set_subtitle("");
+    // Keep the switch in step with the stored mode (no-op when already in sync).
+    ui.reclaim_perm_switch.set_active(perm);
+
+    // Artifacts are cheap — they come straight from the scanned tree.
+    let artifacts = reclaim::find_artifacts(root);
+    *ui.reclaim_data.borrow_mut() = (Vec::new(), artifacts);
+
+    // Measuring the caches/Trash needs disk I/O; do it off the UI thread, behind
+    // the spinner, guarding against a stale result from a superseded entry.
+    let generation = ui.reclaim_gen.get().wrapping_add(1);
+    ui.reclaim_gen.set(generation);
+    ui.stack.set_visible_child_name("scanning");
+
+    let (sender, receiver) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        // Break each spot into per-application entries (notably: never the whole
+        // ~/.cache as one item), then order the whole list largest-first.
+        let mut measured: Vec<Reclaimable> =
+            reclaim::system_spots(&home).iter().flat_map(reclaim::breakdown).collect();
+        measured.sort_by(|a, b| b.size.cmp(&a.size));
+        let _ = sender.send_blocking(measured);
+    });
+
+    let state = state.clone();
+    let ui = ui.clone();
+    glib::spawn_future_local(async move {
+        let Ok(system) = receiver.recv().await else {
+            return;
+        };
+        // Drop the result if the user moved on or re-entered the view since.
+        if ui.reclaim_gen.get() != generation
+            || !matches!(state.borrow().view, View::Reclaim)
+        {
+            return;
+        }
+        ui.reclaim_data.borrow_mut().0 = system;
+        populate_reclaim_lists(&state, &ui, perm);
+        ui.stack.set_visible_child_name("reclaim");
+    });
+}
+
+/// (Re)build the two reclaim lists from the last measured data, with each row's
+/// primary action reflecting `perm` (permanent-delete vs move-to-Trash). Called
+/// after a measurement and whenever the delete-mode switch flips.
+fn populate_reclaim_lists(state: &Rc<RefCell<AppState>>, ui: &Rc<Ui>, perm: bool) {
+    let handler = reclaim_action_handler(state, ui);
+    let data = ui.reclaim_data.borrow();
+    let (system, artifacts) = &*data;
+
+    let total: u64 = system.iter().chain(artifacts).map(|r| r.size).sum();
+    ui.reclaim_total.set_text(&human_size(total));
+
+    clear(&ui.reclaim_system_list);
+    clear(&ui.reclaim_artifact_list);
+
+    ui.reclaim_system_caption.set_visible(!system.is_empty());
+    ui.reclaim_system_list.set_visible(!system.is_empty());
+    for r in system {
+        ui.reclaim_system_list.append(&reclaim_row(r, perm, &handler));
+    }
+
+    ui.reclaim_artifact_caption.set_visible(!artifacts.is_empty());
+    ui.reclaim_artifact_list.set_visible(!artifacts.is_empty());
+    for r in artifacts {
+        ui.reclaim_artifact_list.append(&reclaim_row(r, perm, &handler));
+    }
+
+    if system.is_empty() && artifacts.is_empty() {
+        ui.reclaim_system_list.set_visible(true);
+        ui.reclaim_system_list.append(&placeholder_row("Nothing to reclaim — you're all clean."));
+    }
+}
+
+/// One reclaimable-entry row: kind icon, label over its path, recovered size, and
+/// a primary clear button. Trash is always emptied permanently; caches/artifacts
+/// move to Trash by default, or delete permanently when `perm` is set. The
+/// right-click menu always offers both Trash and permanent delete.
+fn reclaim_row(
+    item: &Reclaimable,
+    perm: bool,
+    handler: &Rc<dyn Fn(RowAction, PathBuf)>,
+) -> gtk::ListBoxRow {
+    let is_trash = item.kind == ReclaimKind::Trash;
+    // Emptying the Trash is inherently permanent; for the rest, honour the mode.
+    let primary = if is_trash || perm { RowAction::Delete } else { RowAction::Trash };
+
+    let icon = gtk::Image::from_icon_name(reclaim_icon(item.kind));
+    icon.set_pixel_size(22);
+
+    let name = gtk::Label::builder().label(&item.label).xalign(0.0).build();
+
+    // Blast radius: a risk badge plus what actually breaks if you delete this.
+    let consequence = reclaim::consequence(item);
+    let badge = gtk::Label::new(Some(consequence.risk.word()));
+    badge.add_css_class("caption");
+    badge.add_css_class(risk_class(consequence.risk));
+    let summary = gtk::Label::builder()
+        .label(&consequence.summary)
+        .xalign(0.0)
+        .wrap(true)
+        .wrap_mode(gtk::pango::WrapMode::WordChar)
+        .build();
+    summary.add_css_class("dim-label");
+    summary.add_css_class("caption");
+    let impact = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    impact.append(&badge);
+    impact.append(&summary);
+
+    let name_area = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    name_area.set_hexpand(true);
+    name_area.set_valign(gtk::Align::Center);
+    name_area.append(&name);
+    name_area.append(&impact);
+
+    // "How big" sits on the right: recovered size over the file count.
+    let size = gtk::Label::builder().label(human_size(item.size)).xalign(1.0).build();
+    size.add_css_class("numeric");
+    let count = gtk::Label::builder().label(files_phrase(item.file_count)).xalign(1.0).build();
+    count.add_css_class("dim-label");
+    count.add_css_class("caption");
+    count.add_css_class("numeric");
+    let size_area = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    size_area.set_valign(gtk::Align::Center);
+    size_area.set_width_request(96);
+    size_area.append(&size);
+    size_area.append(&count);
+
+    let (icon_name, tooltip) = match primary {
+        RowAction::Delete if is_trash => ("user-trash-symbolic", "Empty (delete permanently)"),
+        RowAction::Delete => ("edit-delete-symbolic", "Delete permanently"),
+        _ => ("user-trash-symbolic", "Move to Trash"),
+    };
+    let clear = action_button(icon_name, tooltip, handler, primary, &item.path);
+    if primary == RowAction::Delete {
+        clear.add_css_class("destructive-action");
+    }
+
+    let row_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .margin_start(12)
+        .margin_end(8)
+        .margin_top(8)
+        .margin_bottom(8)
+        .build();
+    row_box.append(&icon);
+    row_box.append(&name_area);
+    row_box.append(&size_area);
+    row_box.append(&clear);
+
+    let row = gtk::ListBoxRow::new();
+    row.set_child(Some(&row_box));
+    row.set_activatable(false);
+    row.set_tooltip_text(Some(&item.path.display().to_string()));
+
+    // Right-click menu: open/reveal plus both removal modes.
+    install_row_actions(&row, &item.path, handler);
+    let menu = gio::Menu::new();
+    menu.append(Some("Open"), Some("row.open"));
+    menu.append(Some("Open Containing Folder"), Some("row.reveal"));
+    menu.append(Some("Copy Full Path"), Some("row.copy-path"));
+    let remove = gio::Menu::new();
+    if !is_trash {
+        remove.append(Some("Move to Trash"), Some("row.trash"));
+    }
+    remove.append(
+        Some(if is_trash { "Empty Trash" } else { "Delete Permanently" }),
+        Some("row.delete"),
+    );
+    menu.append_section(None, &remove);
+    attach_menu(&row, menu);
+
+    row
+}
+
+/// Symbolic icon for a reclaimable entry, by kind.
+fn reclaim_icon(kind: ReclaimKind) -> &'static str {
+    match kind {
+        ReclaimKind::Trash => "user-trash-full-symbolic",
+        ReclaimKind::Cache => "folder-download-symbolic",
+        ReclaimKind::Artifact => "folder-symbolic",
+    }
+}
+
+/// CSS accent class for a deletion risk level.
+fn risk_class(risk: Risk) -> &'static str {
+    match risk {
+        Risk::Safe => "risk-safe",
+        Risk::Rebuild => "risk-rebuild",
+        Risk::Caution => "risk-caution",
+    }
+}
+
+/// "1 file" / "1,234 files" — a grammatical, thousands-grouped count.
+fn files_phrase(n: u64) -> String {
+    let mut grouped = String::new();
+    let digits = n.to_string();
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(ch);
+    }
+    format!("{grouped} {}", if n == 1 { "file" } else { "files" })
+}
+
+/// Reclaim-view action dispatcher. Open / Reveal / Copy behave as elsewhere, but
+/// the removal actions route through [`confirm_clear`], which shows the blast
+/// radius (which app, how many files, how big, what happens) before committing.
+fn reclaim_action_handler(state: &Rc<RefCell<AppState>>, ui: &Rc<Ui>) -> Rc<dyn Fn(RowAction, PathBuf)> {
+    let state = state.clone();
+    let ui = ui.clone();
+    Rc::new(move |action, path| match action {
+        RowAction::Open => open_path(&path, &ui),
+        RowAction::Reveal => reveal_path(&path, &ui),
+        RowAction::Terminal => open_terminal(&path, &ui),
+        RowAction::CopyPath => copy_path(&path, &ui),
+        RowAction::Trash => confirm_clear(&path, false, &state, &ui),
+        RowAction::Delete => confirm_clear(&path, true, &state, &ui),
+    })
+}
+
+/// Show the blast radius for clearing `path`, then (on confirm) clear it.
+///
+/// `perm` requests a permanent delete; the Trash spot is always permanent. The
+/// dialog spells out the impact — which app/area, file count, size — and what
+/// actually happens, drawing the count/size from the already-measured data so it
+/// never re-scans the disk while the user is deciding.
+fn confirm_clear(path: &Path, perm: bool, state: &Rc<RefCell<AppState>>, ui: &Rc<Ui>) {
+    // Recover the measured entry (label, size, count, kind) for this row.
+    let item = {
+        let data = ui.reclaim_data.borrow();
+        data.0.iter().chain(data.1.iter()).find(|r| r.path == path).cloned()
+    };
+    let Some(item) = item else {
+        return; // data changed under us; ignore the stale click
+    };
+
+    let permanent = perm || item.kind == ReclaimKind::Trash;
+    let heading = match (permanent, item.kind) {
+        (_, ReclaimKind::Trash) => "Empty the Trash?".to_string(),
+        (true, _) => format!("Permanently delete {}?", item.label),
+        (false, _) => format!("Move {} to Trash?", item.label),
+    };
+
+    // The blast radius: what breaks if this goes.
+    let consequence = reclaim::consequence(&item);
+    let reversibility = if permanent {
+        "This frees the space now and cannot be undone."
+    } else {
+        "Moving to Trash is reversible; the space is freed once you empty the Trash."
+    };
+
+    let body = format!(
+        "{}\n\nFrees {} across {}.\n\nWhat happens — {}: {}\n\n{reversibility}",
+        item.path.display(),
+        human_size(item.size),
+        files_phrase(item.file_count),
+        consequence.risk.word(),
+        consequence.summary,
+    );
+
+    let dialog = adw::AlertDialog::new(Some(&heading), Some(&body));
+    let confirm_label = if permanent { "Delete" } else { "Move to Trash" };
+    dialog.add_responses(&[("cancel", "Cancel"), ("go", confirm_label)]);
+    dialog.set_response_appearance("go", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    let window = ui.window.clone();
+    let state = state.clone();
+    let ui = ui.clone();
+    let path = path.to_path_buf();
+    dialog.choose(&window, gio::Cancellable::NONE, move |response| {
+        if response != "go" {
+            return;
+        }
+        let result = if permanent {
+            delete_path(&path)
+        } else {
+            gio::File::for_path(&path).trash(gio::Cancellable::NONE).map_err(|e| {
+                std::io::Error::other(e.message().to_string())
+            })
+        };
+        match result {
+            Ok(()) => {
+                ui.toasts.add_toast(adw::Toast::new(if permanent {
+                    "Deleted — space freed"
+                } else {
+                    "Moved to Trash"
+                }));
+                rescan_keeping_position(&state, &ui);
+            }
+            Err(err) => {
+                ui.toasts.add_toast(adw::Toast::new(&format!("Couldn't clear: {err}")));
+            }
+        }
+    });
+}
+
 /// A short label for where a file lives: its parent folder shown relative to the
 /// scanned root (prefixed with the root's name), or the absolute parent path if
 /// it lies outside the root.
@@ -695,14 +1140,51 @@ fn row_action_handler(state: &Rc<RefCell<AppState>>, ui: &Rc<Ui>) -> Rc<dyn Fn(R
         RowAction::Terminal => open_terminal(&path, &ui),
         RowAction::CopyPath => copy_path(&path, &ui),
         RowAction::Trash => confirm_and_trash(path, &state, &ui),
+        RowAction::Delete => confirm_and_delete(path, &state, &ui),
     })
 }
 
-/// Attach a right-click context menu to `row`, dispatching through `handler`.
-///
-/// The menu items map to `app`-less per-row actions installed in a "row" action
-/// group on the row itself, so each row carries its own path.
+/// Install the per-row "row.*" action group on `row`, one action per
+/// [`RowAction`], each bound to this row's `path`. Menus (file or reclaim) then
+/// reference whichever subset they choose to show.
+fn install_row_actions(row: &gtk::ListBoxRow, path: &Path, handler: &Rc<dyn Fn(RowAction, PathBuf)>) {
+    let actions = gio::SimpleActionGroup::new();
+    for (name, action) in [
+        ("open", RowAction::Open),
+        ("reveal", RowAction::Reveal),
+        ("terminal", RowAction::Terminal),
+        ("copy-path", RowAction::CopyPath),
+        ("trash", RowAction::Trash),
+        ("delete", RowAction::Delete),
+    ] {
+        let item = gio::SimpleAction::new(name, None);
+        let handler = handler.clone();
+        let path = path.to_path_buf();
+        item.connect_activate(move |_, _| handler(action, path.clone()));
+        actions.add_action(&item);
+    }
+    row.insert_action_group("row", Some(&actions));
+}
+
+/// Make a secondary (right) click on `row` pop `menu` up at the pointer.
+fn attach_menu(row: &gtk::ListBoxRow, menu: gio::Menu) {
+    let gesture = gtk::GestureClick::new();
+    gesture.set_button(gtk::gdk::BUTTON_SECONDARY);
+    let row_weak = row.downgrade();
+    gesture.connect_pressed(move |gesture, _, x, y| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        if let Some(row) = row_weak.upgrade() {
+            show_row_menu(&row, &menu, x, y);
+        }
+    });
+    row.add_controller(gesture);
+}
+
+/// Attach the standard file/folder right-click menu (Open / Reveal / Terminal /
+/// Copy Path / Move to Trash), backed by the row's "row.*" action group.
 fn attach_context_menu(row: &gtk::ListBoxRow, path: &Path, handler: &Rc<dyn Fn(RowAction, PathBuf)>) {
+    install_row_actions(row, path, handler);
+
     let menu = gio::Menu::new();
     menu.append(Some("Open"), Some("row.open"));
     menu.append(Some("Open Containing Folder"), Some("row.reveal"));
@@ -712,40 +1194,30 @@ fn attach_context_menu(row: &gtk::ListBoxRow, path: &Path, handler: &Rc<dyn Fn(R
     trash_section.append(Some("Move to Trash"), Some("row.trash"));
     menu.append_section(None, &trash_section);
 
-    let actions = gio::SimpleActionGroup::new();
-    for (name, action) in [
-        ("open", RowAction::Open),
-        ("reveal", RowAction::Reveal),
-        ("terminal", RowAction::Terminal),
-        ("copy-path", RowAction::CopyPath),
-        ("trash", RowAction::Trash),
-    ] {
-        let item = gio::SimpleAction::new(name, None);
-        let handler = handler.clone();
-        let path = path.to_path_buf();
-        item.connect_activate(move |_, _| handler(action, path.clone()));
-        actions.add_action(&item);
-    }
-    row.insert_action_group("row", Some(&actions));
+    attach_menu(row, menu);
+}
 
-    // Secondary (right) click pops the menu up at the pointer.
-    let gesture = gtk::GestureClick::new();
-    gesture.set_button(gtk::gdk::BUTTON_SECONDARY);
-    let row_weak = row.downgrade();
-    gesture.connect_pressed(move |gesture, _, x, y| {
-        gesture.set_state(gtk::EventSequenceState::Claimed);
-        let Some(row) = row_weak.upgrade() else {
-            return;
-        };
-        let popover = gtk::PopoverMenu::from_model(Some(&menu));
-        popover.set_parent(&row);
-        popover.set_has_arrow(false);
-        popover.set_halign(gtk::Align::Start);
-        popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-        popover.connect_closed(|popover| popover.unparent());
-        popover.popup();
+/// Pop the context `menu` up over `row`, pointing at `(x, y)`.
+///
+/// Returns the popover so callers (and tests) can inspect it. The popover is
+/// parented to `row` so its menu items resolve the row's "row.*" action group;
+/// on dismissal it unparents itself. Crucially the unparent is **deferred to an
+/// idle callback** rather than run synchronously inside the "closed" handler:
+/// clicking a menu item closes the popover *before* GTK dispatches the item's
+/// action, so unparenting in-line would sever the action group from the widget
+/// tree and the click would silently do nothing.
+fn show_row_menu(row: &gtk::ListBoxRow, menu: &gio::Menu, x: f64, y: f64) -> gtk::PopoverMenu {
+    let popover = gtk::PopoverMenu::from_model(Some(menu));
+    popover.set_parent(row);
+    popover.set_has_arrow(false);
+    popover.set_halign(gtk::Align::Start);
+    popover.set_pointing_to(Some(&gtk::gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+    popover.connect_closed(|popover| {
+        let popover = popover.clone();
+        glib::idle_add_local_once(move || popover.unparent());
     });
-    row.add_controller(gesture);
+    popover.popup();
+    popover
 }
 
 /// Rebuild the clickable breadcrumb: a home icon, then root → current folder.
@@ -1231,6 +1703,72 @@ fn confirm_and_trash(path: PathBuf, state: &Rc<RefCell<AppState>>, ui: &Rc<Ui>) 
     });
 }
 
+/// Confirm, then **permanently** delete `path` and rescan. Unlike trashing, this
+/// frees the space immediately and cannot be undone — used by the Reclaim view.
+fn confirm_and_delete(path: PathBuf, state: &Rc<RefCell<AppState>>, ui: &Rc<Ui>) {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+
+    let dialog = adw::AlertDialog::new(
+        Some("Delete permanently?"),
+        Some(&format!(
+            "“{name}” and everything inside it will be permanently deleted. \
+             This cannot be undone."
+        )),
+    );
+    dialog.add_responses(&[("cancel", "Cancel"), ("delete", "Delete")]);
+    dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    let window = ui.window.clone();
+    let state = state.clone();
+    let ui = ui.clone();
+    dialog.choose(&window, gio::Cancellable::NONE, move |response| {
+        if response == "delete" {
+            match delete_path(&path) {
+                Ok(()) => {
+                    ui.toasts.add_toast(adw::Toast::new("Deleted — space freed"));
+                    rescan_keeping_position(&state, &ui);
+                }
+                Err(err) => {
+                    ui.toasts.add_toast(adw::Toast::new(&format!("Couldn't delete: {err}")));
+                }
+            }
+        }
+    });
+}
+
+/// Permanently remove `path`, freeing its space.
+///
+/// For the Trash spot, deleting the directory itself would remove the user's
+/// Trash root; its *contents* are cleared instead. Otherwise the entry is
+/// removed outright — a whole directory tree, or a single file.
+fn delete_path(path: &Path) -> std::io::Result<()> {
+    if path.ends_with("Trash") {
+        empty_dir(path)
+    } else if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+}
+
+/// Remove every entry inside `dir`, leaving the directory itself in place.
+fn empty_dir(dir: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
 /// Remove every row from a list box.
 fn clear(list: &gtk::ListBox) {
     while let Some(child) = list.first_child() {
@@ -1301,12 +1839,143 @@ mod tests {
     }
 
     #[test]
+    fn delete_path_removes_files_and_trees_but_only_empties_trash() {
+        use std::fs;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // A whole directory tree → removed outright.
+        let tree = tmp.path().join("node_modules");
+        fs::create_dir_all(tree.join("dep/sub")).unwrap();
+        fs::write(tree.join("dep/file"), b"x").unwrap();
+        delete_path(&tree).unwrap();
+        assert!(!tree.exists(), "artifact directory should be gone");
+
+        // A single file → removed.
+        let file = tmp.path().join("blob");
+        fs::write(&file, b"xyz").unwrap();
+        delete_path(&file).unwrap();
+        assert!(!file.exists(), "file should be gone");
+
+        // The Trash spot → emptied, but the Trash directory itself kept.
+        let trash = tmp.path().join("Trash");
+        fs::create_dir_all(trash.join("files")).unwrap();
+        fs::write(trash.join("files/old.bin"), vec![b'x'; 100]).unwrap();
+        delete_path(&trash).unwrap();
+        assert!(trash.is_dir(), "Trash root must remain");
+        assert_eq!(fs::read_dir(&trash).unwrap().count(), 0, "Trash must be emptied");
+    }
+
+    #[test]
+    fn reclaim_row_clear_actions_dispatch() {
+        if gtk::init().is_err() {
+            eprintln!("no display available — skipping GTK reclaim-row test");
+            return;
+        }
+        use std::cell::Cell;
+        let last = Rc::new(Cell::new(None::<RowAction>));
+        let l = last.clone();
+        let handler: Rc<dyn Fn(RowAction, PathBuf)> =
+            Rc::new(move |action, _path| l.set(Some(action)));
+
+        // An artifact in trash-default mode: the row resolves both removal modes.
+        let item = Reclaimable {
+            label: "Node.js packages".into(),
+            path: "/p/node_modules".into(),
+            size: 100,
+            file_count: 42,
+            kind: ReclaimKind::Artifact,
+        };
+        let row = reclaim_row(&item, false, &handler);
+
+        WidgetExt::activate_action(&row, "row.trash", None).unwrap();
+        assert_eq!(last.get(), Some(RowAction::Trash));
+        WidgetExt::activate_action(&row, "row.delete", None).unwrap();
+        assert_eq!(last.get(), Some(RowAction::Delete));
+    }
+
+    #[test]
     fn bucket_class_maps_fraction_to_heat() {
         assert_eq!(bucket_class(0.9), "bucket-5");
         assert_eq!(bucket_class(0.30), "bucket-4");
         assert_eq!(bucket_class(0.15), "bucket-3");
         assert_eq!(bucket_class(0.05), "bucket-2");
         assert_eq!(bucket_class(0.001), "bucket-1");
+    }
+
+    /// Pump the GTK main loop until it runs dry (so popups map and deferred
+    /// idle callbacks — like the popover's unparent — actually run).
+    fn pump() {
+        let ctx = glib::MainContext::default();
+        for _ in 0..50 {
+            if !ctx.iteration(false) {
+                break;
+            }
+        }
+    }
+
+    /// Depth-first search for the first descendant of `widget` whose GType name
+    /// matches `type_name` (e.g. "GtkModelButton" for a popover menu item).
+    fn find_descendant(widget: &gtk::Widget, type_name: &str) -> Option<gtk::Widget> {
+        let mut child = widget.first_child();
+        while let Some(w) = child {
+            if w.type_().name() == type_name {
+                return Some(w);
+            }
+            if let Some(found) = find_descendant(&w, type_name) {
+                return Some(found);
+            }
+            child = w.next_sibling();
+        }
+        None
+    }
+
+    #[test]
+    fn context_menu_item_click_fires_handler() {
+        if gtk::init().is_err() {
+            eprintln!("no display available — skipping GTK context-menu test");
+            return;
+        }
+        use std::cell::Cell;
+        let fired = Rc::new(Cell::new(0u32));
+        let f = fired.clone();
+        let handler: Rc<dyn Fn(RowAction, PathBuf)> =
+            Rc::new(move |_action, _path| f.set(f.get() + 1));
+
+        // A real row, wired exactly as the app wires it (action group + gesture).
+        let n = node("file", 10, false);
+        let row = build_row(&n, 100, None, Some(&handler));
+
+        // Sanity: the "row" action group resolves from the row itself.
+        assert!(
+            WidgetExt::activate_action(&row, "row.open", None).is_ok(),
+            "row.open should resolve to an action"
+        );
+
+        // The row must live in a mapped window for the popover to pop up.
+        let window = gtk::Window::new();
+        let list = gtk::ListBox::new();
+        list.append(&row);
+        window.set_child(Some(&list));
+        window.present();
+        pump();
+
+        // Pop the real context menu and *click* its first item the way a user
+        // would — GTK closes the popover and dispatches the action. This is the
+        // path that was silently failing.
+        let menu = gio::Menu::new();
+        menu.append(Some("Open"), Some("row.open"));
+        let popover = show_row_menu(&row, &menu, 1.0, 1.0);
+        pump();
+
+        let item = find_descendant(popover.upcast_ref::<gtk::Widget>(), "GtkModelButton")
+            .expect("popover should contain a GtkModelButton menu item");
+        fired.set(0); // ignore the sanity activation above; count only the click
+        item.activate();
+        pump();
+
+        assert_eq!(fired.get(), 1, "clicking the menu item should invoke the handler exactly once");
+
+        window.destroy();
     }
 
     #[test]
