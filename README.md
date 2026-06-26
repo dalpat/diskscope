@@ -5,7 +5,7 @@ folder and see — at a glance — what's eating your space, then drill in.
 
 Built with **Rust + GTK4 + libadwaita**.
 
-![status](https://img.shields.io/badge/status-v0.1-blue)
+![status](https://img.shields.io/badge/status-alpha-orange)
 
 ## Screenshots
 
@@ -83,9 +83,27 @@ Keeping all the logic in the GTK-free `core` crate is what makes the engine
 builds real folders on disk, scans them, and asserts on the results — no GTK
 required. The `app` crate adds a thin, separately-testable rendering layer.
 
+## Install (prebuilt — no build tools needed)
+
+Grab the latest tarball from the [**Releases**](https://github.com/dalpat/diskscope/releases)
+page and run its installer. You only need a modern GNOME desktop
+(GTK 4.12+ / libadwaita 1.5+ runtime, e.g. GNOME 44+) — **no compiler, no Rust,
+no `-dev` packages**:
+
+```sh
+tar -xzf diskscope-*-x86_64-linux.tar.gz
+cd diskscope-*-x86_64-linux
+./install.sh          # installs to ~/.local, no root
+```
+
+Then search **DiskScope** in the Activities Overview, or run `diskscope`. Prefer
+not to install? Just run `./diskscope` from the extracted folder. Remove it with
+`./install.sh --uninstall`.
+
 ## Build & run
 
-Requires the GTK4 and libadwaita development packages:
+Building **from source** (not needed if you used a release above) requires the
+GTK4 and libadwaita development packages:
 
 ```sh
 sudo apt-get install -y build-essential pkg-config libgtk-4-dev libadwaita-1-dev

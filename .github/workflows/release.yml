@@ -1,0 +1,96 @@
+name: Release
+
+# Tag a version (e.g. `git tag v0.1.0-alpha.1 && git push origin v0.1.0-alpha.1`)
+# to build a prebuilt binary and publish it as a GitHub Release. Pre-release
+# tags (those containing a hyphen, e.g. -alpha / -beta / -rc) are marked as
+# prereleases automatically.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build & publish (x86_64 linux)
+    # Pinned for a predictable glibc baseline and GTK 4.12+/libadwaita 1.5+.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install GTK4 + libadwaita (build-time only)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libgtk-4-dev libadwaita-1-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p diskscope
+
+      - name: Package release tarball
+        id: pkg
+        run: |
+          set -eu
+          ver="${GITHUB_REF_NAME}"
+          name="diskscope-${ver}-x86_64-linux"
+          stage="dist/${name}"
+          mkdir -p "${stage}"
+          cp target/release/diskscope                 "${stage}/"
+          cp data/dev.diskscope.DiskScope.desktop      "${stage}/"
+          cp data/icons/dev.diskscope.DiskScope.svg    "${stage}/"
+          cp packaging/install.sh                      "${stage}/install.sh"
+          cp LICENSE README.md                         "${stage}/"
+          chmod +x "${stage}/diskscope" "${stage}/install.sh"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+          {
+            echo "tarball=dist/${name}.tar.gz"
+            echo "checksum=dist/${name}.tar.gz.sha256"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Write release notes
+        run: |
+          cat > dist/NOTES.md <<'EOF'
+          Alpha release of **DiskScope** — a native GTK4 disk-usage analyzer for GNOME.
+
+          ### Install — no build tools or `-dev` packages needed
+
+          **Requirements:** x86_64 Linux with a modern GNOME desktop
+          (GTK 4.12+ / libadwaita 1.5+ runtime, e.g. GNOME 44+). These ship with
+          the desktop; you do **not** need to install anything to compile.
+
+          ```sh
+          tar -xzf diskscope-*-x86_64-linux.tar.gz
+          cd diskscope-*-x86_64-linux
+          ./install.sh          # installs to ~/.local, no root
+          ```
+
+          Then search **DiskScope** in the Activities Overview, or run `diskscope`.
+          Prefer not to install? Just run `./diskscope` from the extracted folder.
+
+          Uninstall any time: `./install.sh --uninstall`.
+
+          Verify the download: `sha256sum -c diskscope-*-x86_64-linux.tar.gz.sha256`.
+          EOF
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          flags=""
+          case "${GITHUB_REF_NAME}" in
+            *-*) flags="--prerelease" ;;   # -alpha / -beta / -rc → prerelease
+          esac
+          gh release create "${GITHUB_REF_NAME}" \
+            "${{ steps.pkg.outputs.tarball }}" \
+            "${{ steps.pkg.outputs.checksum }}" \
+            --title "DiskScope ${GITHUB_REF_NAME}" \
+            --notes-file dist/NOTES.md \
+            ${flags}
