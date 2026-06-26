@@ -68,15 +68,21 @@ A two-crate workspace splits the pure logic from the GUI:
 
 | Path | Role |
 |------|------|
-| `core/src/scan.rs` | The scan engine — walks the tree, totals sizes, sorts. **No GTK.** |
+| `core/src/scan.rs` | The scan engine — a **parallel, cancellable** tree walk that totals sizes and sorts. **No GTK.** |
 | `core/src/category.rs` | Classifies files into categories and aggregates per-category usage. **No GTK.** |
 | `core/src/disk.rs` | Whole-filesystem capacity (total/free) via `statvfs`. **No GTK.** |
 | `core/src/reclaim.rs` | Finds safe-to-clear space: system spots (Trash, caches) + regenerable project artifacts. **No GTK.** |
 | `core/src/format.rs` | Byte → human-readable formatting. **No GTK.** |
 | `core/src/lib.rs` | The `diskscope` library (re-exports the modules above). |
 | `core/tests/scan_e2e.rs` | End-to-end tests over real temporary directory trees. |
-| `app/src/ui.rs` | GTK4/libadwaita view: renders what the engine produces. |
+| `app/src/ui/` | GTK4/libadwaita view, split by concern: `mod.rs` (window + state), `draw.rs` (Cairo), `rows.rs` (row builders), `actions.rs` (open/trash/delete + menus), `views.rs` (the render loop), `scanning.rs` (scan lifecycle + cancellation). |
 | `app/src/main.rs` | Boots the application. |
+
+The scan walk runs in parallel (via [`rayon`](https://crates.io/crates/rayon)), so
+a large — often near-full — tree overlaps its many `stat` calls across cores
+instead of serialising them. A scan is **cancellable**: a shared flag lets the
+"Scanning…" page's **Cancel** button abandon a slow walk without waiting for it
+to finish.
 
 Keeping all the logic in the GTK-free `core` crate is what makes the engine
 **testable end to end without a display server**: `cargo test -p diskscope-core`
@@ -146,13 +152,13 @@ builds against the system runtime with no root access.
 ## Test
 
 ```sh
-cargo test                     # whole workspace (32 tests)
+cargo test                     # whole workspace (35 tests)
 cargo test -p diskscope-core   # just the engine — needs no GTK at all
 ```
 
 The suite covers the scan engine end to end (real temp directory trees:
 recursive sizes, sort order, hidden files, symlink safety, hardlink
-de-duplication), size formatting,
+de-duplication, and cancellation), size formatting,
 the heat-map bucketing, breadcrumb path re-location, and a headless GTK test
 that builds real widgets and asserts the rendered rows.
 
