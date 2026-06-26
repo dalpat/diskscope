@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Dalpat Singh
+
 //! diskscope core — pure, GUI-independent disk-usage logic.
 //!
 //! This crate deliberately has **no GTK dependency**. The directory-scanning

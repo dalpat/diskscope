@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Dalpat Singh
+
 //! Human-readable formatting helpers.
 
 /// Format a byte count as a human-readable string using binary (1024) units.

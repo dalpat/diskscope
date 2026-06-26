@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Dalpat Singh
+
 //! DiskScope — a native GTK4 disk-usage analyzer.
 //!
 //! `main` does nothing but boot the GTK/libadwaita application and hand off to

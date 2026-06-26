@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Dalpat Singh
+
 //! End-to-end tests for the scan engine against real temporary directory trees.
 //!
 //! Each test builds an actual directory on disk, scans it, and asserts on the

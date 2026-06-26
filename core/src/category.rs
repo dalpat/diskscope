@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Dalpat Singh
+
 //! Classify files into storage categories (Videos, Audio, Images, …) and
 //! aggregate usage per category — the data behind the storage overview.
 

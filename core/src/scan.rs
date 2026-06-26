@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Dalpat Singh
+
 //! The disk-usage scan engine: walk a directory tree and total up sizes.
 
 use std::collections::HashSet;

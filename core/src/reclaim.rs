@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Dalpat Singh
+
 //! Find space that can be reclaimed **without losing important files**.
 //!
 //! Two sources, both safe by construction:

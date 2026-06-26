@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Dalpat Singh
+
 //! GTK4 + libadwaita front-end. A thin, stateful view over the scan engine.
 //!
 //! Views, dispatched by [`render`]:

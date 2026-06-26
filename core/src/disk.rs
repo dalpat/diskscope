@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) 2026 Dalpat Singh
+
 //! Whole-filesystem capacity (total / free), via `statvfs`. Used for the
 //! capacity ring on the overview — distinct from the *scanned folder's* size.
 

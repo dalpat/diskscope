@@ -137,4 +137,9 @@ DISKSCOPE_SHOT=/tmp/shot.png cargo run -p diskscope -- ~/Downloads
 
 ## License
 
-MIT
+DiskScope is free software, licensed under the **GNU General Public License
+v3.0 or later** (`GPL-3.0-or-later`). You may redistribute and/or modify it
+under those terms; it comes with no warranty. See [`LICENSE`](LICENSE) for the
+full text.
+
+Copyright (C) 2026 Dalpat Singh
