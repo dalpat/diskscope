@@ -215,12 +215,20 @@ pub fn build_ui(app: &adw::Application, initial: Option<String>) {
     browse_button.set_margin_top(6);
     browse_button.add_css_class("pill");
 
+    // Anchor the bar/legend/list to "this folder", contrasting the ring's
+    // whole-disk reading so the two aren't conflated.
+    let breakdown_caption =
+        gtk::Label::builder().xalign(0.0).label("This folder, by type").build();
+    breakdown_caption.add_css_class("dim-label");
+    breakdown_caption.add_css_class("caption");
+
     let overview_inner = gtk::Box::new(gtk::Orientation::Vertical, 12);
     overview_inner.set_margin_top(18);
     overview_inner.set_margin_bottom(18);
     overview_inner.set_margin_start(12);
     overview_inner.set_margin_end(12);
     overview_inner.append(&top_row);
+    overview_inner.append(&breakdown_caption);
     overview_inner.append(&overview_bar);
     overview_inner.append(&legend);
     overview_inner.append(&overview_list);
@@ -771,14 +779,41 @@ fn build_row(
     row_box.append(&size);
     row_box.append(&percent_label);
 
-    if let Some(handler) = handler {
-        row_box.append(&action_button("document-open-symbolic", "Open", handler, RowAction::Open, &node.path));
-        row_box.append(&action_button("user-trash-symbolic", "Move to Trash", handler, RowAction::Trash, &node.path));
+    // Trailing actions live in a revealer that slides them in only while the
+    // pointer is over the row — so a destructive button isn't sitting one stray
+    // click away on every row at rest.
+    let revealer = handler.map(|handler| {
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        actions.append(&action_button("external-link-symbolic", "Open", handler, RowAction::Open, &node.path));
+        actions.append(&action_button("user-trash-symbolic", "Move to Trash", handler, RowAction::Trash, &node.path));
+        gtk::Revealer::builder()
+            .transition_type(gtk::RevealerTransitionType::SlideLeft)
+            .child(&actions)
+            .build()
+    });
+    if let Some(revealer) = &revealer {
+        row_box.append(revealer);
+    }
+
+    // A chevron marks the rows you can drill into (directories), matching the
+    // category list; files get none.
+    if node.is_dir {
+        let chevron = gtk::Image::from_icon_name("go-next-symbolic");
+        chevron.add_css_class("dim-label");
+        row_box.append(&chevron);
     }
 
     let row = gtk::ListBoxRow::new();
     row.set_child(Some(&row_box));
     row.set_activatable(node.is_dir);
+
+    if let Some(revealer) = revealer {
+        let motion = gtk::EventControllerMotion::new();
+        let enter = revealer.clone();
+        motion.connect_enter(move |_, _, _| enter.set_reveal_child(true));
+        motion.connect_leave(move |_| revealer.set_reveal_child(false));
+        row.add_controller(motion);
+    }
     row
 }
 
@@ -891,6 +926,11 @@ fn draw_ring(cr: &gtk::cairo::Context, w: i32, h: i32, usage: Option<DiskUsage>)
         return;
     };
     let fraction = (usage.used() as f64 / usage.total as f64).clamp(0.0, 1.0);
+    // Below ~0.5% the round-capped arc collapses to a lone dot floating on an
+    // otherwise empty ring; show just the clean track instead.
+    if fraction < 0.005 {
+        return;
+    }
     let (r, g, b) = if fraction < 0.75 {
         (0.18, 0.76, 0.49) // healthy — green
     } else if fraction < 0.90 {
