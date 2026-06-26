@@ -1,0 +1,11 @@
+# Workspace root. Two crates:
+#   core/ — pure scan engine + formatting (no GTK; fully unit/E2E tested)
+#   app/  — GTK4 + libadwaita front-end over the core
+[workspace]
+resolver = "2"
+members = ["core", "app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"

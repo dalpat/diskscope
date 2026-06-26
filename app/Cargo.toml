@@ -1,0 +1,17 @@
+[package]
+name = "diskscope"
+description = "A clean, native disk-usage analyzer for GNOME"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "diskscope"
+path = "src/main.rs"
+
+[dependencies]
+# The pure core, aliased to `diskscope` so the UI does `use diskscope::...`.
+diskscope = { package = "diskscope-core", path = "../core" }
+gtk = { version = "0.9", package = "gtk4", features = ["v4_12"] }
+adw = { version = "0.7", package = "libadwaita", features = ["v1_5"] }
+async-channel = "2"

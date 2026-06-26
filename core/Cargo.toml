@@ -1,0 +1,17 @@
+[package]
+name = "diskscope-core"
+description = "Pure, GUI-independent disk-usage scanning engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Exposed as `diskscope` so consumers `use diskscope::...`.
+[lib]
+name = "diskscope"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
