@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=DiskScope
+GenericName=Disk Usage Analyzer
+Comment=See what's eating your disk space, then drill in
+# install.sh rewrites this to the absolute path of the installed binary.
+Exec=diskscope %f
+Icon=dev.diskscope.DiskScope
+Terminal=false
+Categories=GTK;System;Filesystem;
+Keywords=disk;usage;storage;space;analyzer;cleanup;du;
+MimeType=inode/directory;
+StartupNotify=true
+StartupWMClass=dev.diskscope.DiskScope
