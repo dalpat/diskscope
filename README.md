@@ -7,6 +7,18 @@ Built with **Rust + GTK4 + libadwaita**.
 
 ![status](https://img.shields.io/badge/status-v0.1-blue)
 
+## Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/overview.png" alt="Storage overview — capacity ring, type breakdown, and categories" width="720">
+</p>
+
+| Browse folders (heat-mapped tree) | Free up space (with blast radius) |
+| :---: | :---: |
+| <img src="docs/screenshots/browse.png" alt="Folder browser with colour-coded heat bars" width="360"> | <img src="docs/screenshots/reclaim.png" alt="Reclaimable space with per-item risk badges" width="360"> |
+
+> Screenshots use a synthetic demo folder — no real files.
+
 ## What it does
 
 Open it and you land on a **storage overview** (think Android's Storage
