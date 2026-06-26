@@ -30,6 +30,7 @@ progressbar.bucket-2 > trough > progress { background-color: #2ec27e; }
 progressbar.bucket-1 > trough > progress { background-color: #3584e4; }
 .current-crumb { font-weight: bold; }
 .crumbs button { padding: 2px 8px; min-height: 0; }
+.row-actions { transition: opacity 150ms ease-in-out; }
 .cat-videos { color: #e01b24; }
 .cat-audio { color: #9141ac; }
 .cat-images { color: #e66100; }
@@ -879,20 +880,19 @@ fn build_row(
     row_box.append(&size);
     row_box.append(&percent_label);
 
-    // Trailing actions live in a revealer that slides them in only while the
-    // pointer is over the row — so a destructive button isn't sitting one stray
-    // click away on every row at rest.
-    let revealer = handler.map(|handler| {
+    // Trailing actions fade in on hover. They always occupy their space and only
+    // their opacity changes, so revealing them never reflows the row — that keeps
+    // the destructive button discreet at rest without any layout flicker.
+    let actions = handler.map(|handler| {
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+        actions.add_css_class("row-actions");
+        actions.set_opacity(0.0);
         actions.append(&action_button("external-link-symbolic", "Open", handler, RowAction::Open, &node.path));
         actions.append(&action_button("user-trash-symbolic", "Move to Trash", handler, RowAction::Trash, &node.path));
-        gtk::Revealer::builder()
-            .transition_type(gtk::RevealerTransitionType::SlideLeft)
-            .child(&actions)
-            .build()
+        actions
     });
-    if let Some(revealer) = &revealer {
-        row_box.append(revealer);
+    if let Some(actions) = &actions {
+        row_box.append(actions);
     }
 
     // A chevron marks the rows you can drill into (directories), matching the
@@ -913,11 +913,11 @@ fn build_row(
         attach_context_menu(&row, &node.path, handler);
     }
 
-    if let Some(revealer) = revealer {
+    if let Some(actions) = actions {
         let motion = gtk::EventControllerMotion::new();
-        let enter = revealer.clone();
-        motion.connect_enter(move |_, _, _| enter.set_reveal_child(true));
-        motion.connect_leave(move |_| revealer.set_reveal_child(false));
+        let enter = actions.clone();
+        motion.connect_enter(move |_, _, _| enter.set_opacity(1.0));
+        motion.connect_leave(move |_| actions.set_opacity(0.0));
         row.add_controller(motion);
     }
     row
