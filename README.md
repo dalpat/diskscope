@@ -93,7 +93,7 @@ required. The `app` crate adds a thin, separately-testable rendering layer.
 
 Grab the latest tarball from the [**Releases**](https://github.com/dalpat/diskscope/releases)
 page and run its installer. You only need a modern GNOME desktop
-(GTK 4.12+ / libadwaita 1.5+ runtime, e.g. GNOME 44+) — **no compiler, no Rust,
+(GTK 4.16+ / libadwaita 1.6+ runtime, e.g. GNOME 47+) — **no compiler, no Rust,
 no `-dev` packages**:
 
 ```sh

@@ -17,15 +17,22 @@ env:
 jobs:
   release:
     name: Build & publish (x86_64 linux)
-    # Pinned for a predictable glibc baseline and GTK 4.12+/libadwaita 1.5+.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
+    # The app uses AdwSpinner (libadwaita 1.6+, which needs GTK 4.16+). The hosted
+    # ubuntu-24.04 image only ships libadwaita 1.5, so build inside the current
+    # Ubuntu release container, which has the newer runtime. `rolling` tracks the
+    # latest supported release, so its apt repos stay live (unlike pinning an
+    # intermediate, now-EOL version).
+    container: ubuntu:rolling
     steps:
-      - uses: actions/checkout@v4
-
       - name: Install GTK4 + libadwaita (build-time only)
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libgtk-4-dev libadwaita-1-dev
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config libgtk-4-dev libadwaita-1-dev \
+            curl ca-certificates git
+
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -61,8 +68,8 @@ jobs:
 
           ### Install — no build tools or `-dev` packages needed
 
-          **Requirements:** x86_64 Linux with a modern GNOME desktop
-          (GTK 4.12+ / libadwaita 1.5+ runtime, e.g. GNOME 44+). These ship with
+          **Requirements:** x86_64 Linux with a recent GNOME desktop
+          (GTK 4.16+ / libadwaita 1.6+ runtime, e.g. GNOME 47+). These ship with
           the desktop; you do **not** need to install anything to compile.
 
           ```sh
@@ -79,18 +86,14 @@ jobs:
           Verify the download: `sha256sum -c diskscope-*-x86_64-linux.tar.gz.sha256`.
           EOF
 
+      # A JS action handles the publish so it works inside the container without
+      # the GitHub CLI; prereleases are detected from the hyphen in the tag.
       - name: Create GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -eu
-          flags=""
-          case "${GITHUB_REF_NAME}" in
-            *-*) flags="--prerelease" ;;   # -alpha / -beta / -rc → prerelease
-          esac
-          gh release create "${GITHUB_REF_NAME}" \
-            "${{ steps.pkg.outputs.tarball }}" \
-            "${{ steps.pkg.outputs.checksum }}" \
-            --title "DiskScope ${GITHUB_REF_NAME}" \
-            --notes-file dist/NOTES.md \
-            ${flags}
+        uses: softprops/action-gh-release@v2
+        with:
+          name: DiskScope ${{ github.ref_name }}
+          body_path: dist/NOTES.md
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            ${{ steps.pkg.outputs.tarball }}
+            ${{ steps.pkg.outputs.checksum }}

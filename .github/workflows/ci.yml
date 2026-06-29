@@ -21,16 +21,21 @@ jobs:
       - name: Test the scan engine
         run: cargo test -p diskscope-core
 
-  # Full workspace, including the GTK4/libadwaita front-end.
+  # Full workspace, including the GTK4/libadwaita front-end. The app uses
+  # AdwSpinner (libadwaita 1.6+ / GTK 4.16+), which the hosted ubuntu-24.04 image
+  # doesn't have, so run inside the current Ubuntu release container instead.
   workspace:
     name: workspace (GTK)
     runs-on: ubuntu-latest
+    container: ubuntu:rolling
     steps:
-      - uses: actions/checkout@v4
       - name: Install GTK4 + libadwaita
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libgtk-4-dev libadwaita-1-dev
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config libgtk-4-dev libadwaita-1-dev \
+            curl ca-certificates git
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
