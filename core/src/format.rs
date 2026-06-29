@@ -30,6 +30,26 @@ pub fn human_size(bytes: u64) -> String {
     format!("{size:.1} {}", UNITS[unit])
 }
 
+/// Group a number with thousands separators, e.g. `1234567` → `"1,234,567"`.
+///
+/// ```
+/// use diskscope::format::thousands;
+/// assert_eq!(thousands(0), "0");
+/// assert_eq!(thousands(42), "42");
+/// assert_eq!(thousands(1_234_567), "1,234,567");
+/// ```
+pub fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::human_size;
