@@ -18,7 +18,7 @@ use diskscope::reclaim::{self, Reclaimable};
 use diskscope::scan::Node;
 
 use super::rows::{build_row, category_css_class, category_row, placeholder_row, reclaim_row};
-use super::actions::{reclaim_action_handler, row_action_handler};
+use super::actions::{reclaim_action_handler, reclaim_select_handler, row_action_handler};
 use super::scanning::folder_node;
 use super::{clear, clear_box, connect, icon_button, AppState, RowAction, Ui, View};
 
@@ -32,6 +32,7 @@ pub(super) fn render(state: &Rc<RefCell<AppState>>, ui: &Rc<Ui>) {
 
     ui.home_button.set_sensitive(true);
     ui.refresh_button.set_sensitive(true);
+    ui.search_button.set_sensitive(true);
     ui.up_button.set_sensitive(matches!(&s.view, View::Folder(p) if !p.is_empty()));
 
     match &s.view {
@@ -39,7 +40,61 @@ pub(super) fn render(state: &Rc<RefCell<AppState>>, ui: &Rc<Ui>) {
         View::Category(category) => render_category(root, *category, state, ui),
         View::Folder(path) => render_folder(root, path, state, ui),
         View::Reclaim => render_reclaim(root, state, ui, s.reclaim_perm_delete),
+        View::Search => render_search(root, &s.search_query, s.search_min, state, ui),
     }
+}
+
+/// The search results page: every entry whose name matches the query, with its
+/// location, acting in place. Directory results navigate; file results expose
+/// the usual hover/menu actions (Open / Reveal / Trash …).
+fn render_search(
+    root: &Node,
+    query: &str,
+    min_size: u64,
+    state: &Rc<RefCell<AppState>>,
+    ui: &Rc<Ui>,
+) {
+    const SHOWN: usize = 200;
+
+    clear_box(&ui.crumbs);
+    let label = gtk::Label::new(Some("Search results"));
+    label.add_css_class("dim-label");
+    ui.crumbs.append(&label);
+
+    clear(&ui.list);
+    ui.search_paths.borrow_mut().clear();
+
+    if query.is_empty() {
+        ui.list.append(&placeholder_row("Type to search this folder by name."));
+        ui.title.set_title("Search");
+        ui.title.set_subtitle("");
+        ui.stack.set_visible_child_name("list");
+        return;
+    }
+
+    let hits = diskscope::scan::search(root, query, min_size);
+    let total: u64 = hits.iter().map(|n| n.size).sum();
+
+    let handler = row_action_handler(state, ui);
+    if hits.is_empty() {
+        ui.list.append(&placeholder_row(&format!("No matches for “{query}”.")));
+    }
+    let mut paths = ui.search_paths.borrow_mut();
+    for node in hits.iter().take(SHOWN) {
+        let location = file_location(&root.path, &node.path);
+        ui.list.append(&build_row(node, total.max(1), Some(&location), Some(&handler)));
+        paths.push(node.path.clone());
+    }
+    drop(paths);
+    if hits.len() > SHOWN {
+        ui.list
+            .append(&placeholder_row(&format!("…and {} more matches", hits.len() - SHOWN)));
+    }
+
+    let plural = if hits.len() == 1 { "result" } else { "results" };
+    ui.title.set_title(&format!("{} {plural}", hits.len()));
+    ui.title.set_subtitle(&format!("“{query}” · {}", human_size(total)));
+    ui.stack.set_visible_child_name("list");
 }
 
 /// The storage homepage: segmented bar + category list.
@@ -144,6 +199,9 @@ fn render_reclaim(root: &Node, state: &Rc<RefCell<AppState>>, ui: &Rc<Ui>, perm:
     ui.title.set_subtitle("");
     // Keep the switch in step with the stored mode (no-op when already in sync).
     ui.reclaim_perm_switch.set_active(perm);
+    // Note: the selection is cleared when the view is *entered* (see the Reclaim
+    // button handler), not here — `render` holds an immutable borrow of the
+    // state for the whole dispatch, so a `borrow_mut` here would panic.
 
     // Artifacts are cheap — they come straight from the scanned tree.
     let artifacts = reclaim::find_artifacts(root);
@@ -189,6 +247,8 @@ fn render_reclaim(root: &Node, state: &Rc<RefCell<AppState>>, ui: &Rc<Ui>, perm:
 /// after a measurement and whenever the delete-mode switch flips.
 pub(super) fn populate_reclaim_lists(state: &Rc<RefCell<AppState>>, ui: &Rc<Ui>, perm: bool) {
     let handler = reclaim_action_handler(state, ui);
+    let on_select = reclaim_select_handler(state, ui);
+    let selected = state.borrow().reclaim_selected.clone();
     let data = ui.reclaim_data.borrow();
     let (system, artifacts) = &*data;
 
@@ -201,18 +261,43 @@ pub(super) fn populate_reclaim_lists(state: &Rc<RefCell<AppState>>, ui: &Rc<Ui>,
     ui.reclaim_system_caption.set_visible(!system.is_empty());
     ui.reclaim_system_list.set_visible(!system.is_empty());
     for r in system {
-        ui.reclaim_system_list.append(&reclaim_row(r, perm, &handler));
+        ui.reclaim_system_list.append(&reclaim_row(r, perm, selected.contains(&r.path), &handler, &on_select));
     }
 
     ui.reclaim_artifact_caption.set_visible(!artifacts.is_empty());
     ui.reclaim_artifact_list.set_visible(!artifacts.is_empty());
     for r in artifacts {
-        ui.reclaim_artifact_list.append(&reclaim_row(r, perm, &handler));
+        ui.reclaim_artifact_list.append(&reclaim_row(r, perm, selected.contains(&r.path), &handler, &on_select));
     }
 
     if system.is_empty() && artifacts.is_empty() {
         ui.reclaim_system_list.set_visible(true);
         ui.reclaim_system_list.append(&placeholder_row("Nothing to reclaim — you're all clean."));
+    }
+
+    drop(data);
+    update_reclaim_selection_bar(state, ui);
+}
+
+/// Refresh the batch-selection bar from the current selection: hide it when
+/// nothing is ticked, otherwise show the count, combined size, and a clear button
+/// labelled for the active removal mode.
+pub(super) fn update_reclaim_selection_bar(state: &Rc<RefCell<AppState>>, ui: &Rc<Ui>) {
+    let s = state.borrow();
+    let data = ui.reclaim_data.borrow();
+    let (mut count, mut bytes) = (0u64, 0u64);
+    for r in data.0.iter().chain(data.1.iter()) {
+        if s.reclaim_selected.contains(&r.path) {
+            count += 1;
+            bytes += r.size;
+        }
+    }
+
+    ui.reclaim_select_bar.set_visible(count > 0);
+    if count > 0 {
+        ui.reclaim_select_label.set_text(&format!("{count} selected · {}", human_size(bytes)));
+        let verb = if s.reclaim_perm_delete { "Delete" } else { "Move to Trash" };
+        ui.reclaim_clear_button.set_label(&format!("{verb} ({count})"));
     }
 }
 

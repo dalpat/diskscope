@@ -199,11 +199,21 @@ fn action_button(
 pub(super) fn reclaim_row(
     item: &Reclaimable,
     perm: bool,
+    selected: bool,
     handler: &Rc<dyn Fn(RowAction, PathBuf)>,
+    on_select: &Rc<dyn Fn(PathBuf, bool)>,
 ) -> gtk::ListBoxRow {
     let is_trash = item.kind == ReclaimKind::Trash;
     // Emptying the Trash is inherently permanent; for the rest, honour the mode.
     let primary = if is_trash || perm { RowAction::Delete } else { RowAction::Trash };
+
+    // Leading checkbox feeds the batch-selection bar.
+    let check = gtk::CheckButton::builder().active(selected).valign(gtk::Align::Center).build();
+    {
+        let on_select = on_select.clone();
+        let path = item.path.clone();
+        check.connect_toggled(move |c| on_select(path.clone(), c.is_active()));
+    }
 
     let icon = gtk::Image::from_icon_name(reclaim_icon(item.kind));
     icon.set_pixel_size(22);
@@ -264,6 +274,7 @@ pub(super) fn reclaim_row(
         .margin_top(8)
         .margin_bottom(8)
         .build();
+    row_box.append(&check);
     row_box.append(&icon);
     row_box.append(&name_area);
     row_box.append(&size_area);
@@ -314,15 +325,7 @@ fn risk_class(risk: Risk) -> &'static str {
 
 /// "1 file" / "1,234 files" — a grammatical, thousands-grouped count.
 pub(super) fn files_phrase(n: u64) -> String {
-    let mut grouped = String::new();
-    let digits = n.to_string();
-    for (i, ch) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i).is_multiple_of(3) {
-            grouped.push(',');
-        }
-        grouped.push(ch);
-    }
-    format!("{grouped} {}", if n == 1 { "file" } else { "files" })
+    format!("{} {}", diskscope::format::thousands(n), if n == 1 { "file" } else { "files" })
 }
 
 /// Symbolic icon name for a category.

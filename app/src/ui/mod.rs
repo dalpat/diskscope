@@ -12,6 +12,7 @@
 //!   artifacts found in the scanned tree.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -20,7 +21,7 @@ use gtk::glib;
 
 use diskscope::category::Category;
 use diskscope::disk::DiskUsage;
-use diskscope::reclaim::Reclaimable;
+use diskscope::reclaim::{self, Reclaimable, Risk};
 use diskscope::scan::{CancelFlag, Node};
 
 mod actions;
@@ -30,7 +31,7 @@ mod scanning;
 mod views;
 
 use draw::{draw_ring, draw_segments};
-use scanning::{folder_node, open_dialog, rescan_keeping_position, start_scan};
+use scanning::{folder_node, locate, open_dialog, rescan_keeping_position, start_scan};
 use views::{populate_reclaim_lists, render};
 
 /// Theme additions: heat-map usage bars, category accent colours, crumb styling.
@@ -66,6 +67,7 @@ enum View {
     Category(Category),
     Folder(Vec<usize>), // drill-down path of child indices from the root
     Reclaim,            // safe-to-clear space (Trash, caches, build artifacts)
+    Search,             // name search over the scanned tree (query in AppState)
 }
 
 /// What the user is currently looking at.
@@ -78,11 +80,23 @@ struct AppState {
     /// settings — see the project's YAGNI stance). Permanent delete is also
     /// always available per-row via the right-click menu.
     reclaim_perm_delete: bool,
+    /// Search view: the current name query and the minimum-size filter (bytes).
+    search_query: String,
+    search_min: u64,
+    /// Reclaim view: the set of entry paths currently ticked for a batch clear.
+    reclaim_selected: HashSet<PathBuf>,
 }
 
 impl Default for AppState {
     fn default() -> Self {
-        AppState { root: None, view: View::Overview, reclaim_perm_delete: false }
+        AppState {
+            root: None,
+            view: View::Overview,
+            reclaim_perm_delete: false,
+            search_query: String::new(),
+            search_min: 0,
+            reclaim_selected: HashSet::new(),
+        }
     }
 }
 
@@ -105,6 +119,7 @@ struct Ui {
     home_button: gtk::Button,
     up_button: gtk::Button,
     refresh_button: gtk::Button,
+    search_button: gtk::ToggleButton,
     /// The cancel flag of the scan currently in flight, if any. The "Scanning…"
     /// page's Cancel button flips it to abandon a slow walk; cleared once the
     /// scan settles (completed or cancelled).
@@ -112,6 +127,9 @@ struct Ui {
     /// Generation guard for the folder scan: a result from a superseded scan
     /// (another started while it ran) is dropped instead of clobbering state.
     scan_gen: Rc<Cell<u64>>,
+    // Scanning page: live progress readouts updated from the walk's counters.
+    scan_detail: gtk::Label,
+    scan_path: gtk::Label,
     // Overview page.
     overview_total: gtk::Label,
     capacity_ring: gtk::DrawingArea,
@@ -122,12 +140,19 @@ struct Ui {
     legend: gtk::FlowBox,
     overview_list: gtk::ListBox,
     overview_data: Rc<RefCell<Vec<(Category, u64)>>>,
-    // Shared list page (folder + category).
+    // Shared list page (folder + category + search).
     crumbs: gtk::Box,
     list: gtk::ListBox,
+    /// Paths of the rows currently shown in the search results, in row order, so
+    /// activating a directory result can navigate straight to it.
+    search_paths: Rc<RefCell<Vec<PathBuf>>>,
     // Reclaim page.
     reclaim_total: gtk::Label,
     reclaim_perm_switch: gtk::Switch,
+    /// Batch-selection bar: shown when one or more entries are ticked.
+    reclaim_select_bar: gtk::Box,
+    reclaim_select_label: gtk::Label,
+    reclaim_clear_button: gtk::Button,
     reclaim_system_caption: gtk::Label,
     reclaim_system_list: gtk::ListBox,
     reclaim_artifact_caption: gtk::Label,
@@ -173,6 +198,11 @@ pub fn build_ui(app: &adw::Application, initial: Option<String>) {
     let open_button = icon_button("folder-open-symbolic", "Analyze another folder");
     let refresh_button = icon_button("view-refresh-symbolic", "Rescan");
     refresh_button.set_sensitive(false);
+    let search_button = gtk::ToggleButton::new();
+    search_button.set_icon_name("system-search-symbolic");
+    search_button.set_tooltip_text(Some("Search files (Ctrl+F)"));
+    search_button.add_css_class("flat");
+    search_button.set_sensitive(false);
 
     let title = adw::WindowTitle::new("DiskScope", "");
     let header = adw::HeaderBar::new();
@@ -180,7 +210,29 @@ pub fn build_ui(app: &adw::Application, initial: Option<String>) {
     header.pack_start(&up_button);
     header.pack_end(&open_button);
     header.pack_end(&refresh_button);
+    header.pack_end(&search_button);
     header.set_title_widget(Some(&title));
+
+    // --- Search bar (a second top bar, revealed by the header toggle) ----------
+    let search_entry = gtk::SearchEntry::new();
+    search_entry.set_placeholder_text(Some("Search files and folders by name"));
+    search_entry.set_hexpand(true);
+    let size_filter =
+        gtk::DropDown::from_strings(&["Any size", "≥ 1 MB", "≥ 10 MB", "≥ 100 MB", "≥ 1 GB"]);
+    size_filter.set_valign(gtk::Align::Center);
+    size_filter.set_tooltip_text(Some("Only show matches at least this big"));
+    let search_inner = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    search_inner.set_hexpand(true);
+    search_inner.append(&search_entry);
+    search_inner.append(&size_filter);
+    let search_bar = gtk::SearchBar::builder().build();
+    search_bar.set_child(Some(&search_inner));
+    search_bar.connect_entry(&search_entry);
+    search_button
+        .bind_property("active", &search_bar, "search-mode-enabled")
+        .bidirectional()
+        .sync_create()
+        .build();
 
     // --- Empty / scanning states -------------------------------------------
     let empty_button = gtk::Button::with_label("Open Folder…");
@@ -194,14 +246,32 @@ pub fn build_ui(app: &adw::Application, initial: Option<String>) {
         .child(&empty_button)
         .build();
 
-    let spinner = gtk::Spinner::builder().spinning(true).width_request(48).height_request(48).build();
+    // AdwSpinner, not GtkSpinner: the GTK spinner redraws its fading dots every
+    // frame via a CSS animation, which keeps the GPU busy recompositing for the
+    // whole scan (worst on the slow, near-full-disk scans). AdwSpinner renders a
+    // single rotating paintable and is far cheaper to animate.
+    let spinner = adw::Spinner::builder().width_request(48).height_request(48).build();
+    // Live heartbeat: a running "<bytes> · <count> items" total over the current
+    // path, updated on a timer from the scan's shared progress counters — so a
+    // long walk visibly works instead of sitting behind a blind spinner.
+    let scan_detail = gtk::Label::new(Some("Starting…"));
+    scan_detail.add_css_class("title-4");
+    scan_detail.set_margin_top(12);
+    let scan_path = gtk::Label::builder()
+        .ellipsize(gtk::pango::EllipsizeMode::Middle)
+        .max_width_chars(46)
+        .build();
+    scan_path.add_css_class("dim-label");
+    scan_path.add_css_class("caption");
     let cancel_button = gtk::Button::with_label("Cancel");
     cancel_button.add_css_class("pill");
     cancel_button.set_halign(gtk::Align::Center);
-    cancel_button.set_margin_top(12);
-    let scanning_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    cancel_button.set_margin_top(16);
+    let scanning_box = gtk::Box::new(gtk::Orientation::Vertical, 4);
     scanning_box.set_halign(gtk::Align::Center);
     scanning_box.append(&spinner);
+    scanning_box.append(&scan_detail);
+    scanning_box.append(&scan_path);
     scanning_box.append(&cancel_button);
     let scanning = adw::StatusPage::builder()
         .title("Scanning…")
@@ -388,6 +458,33 @@ pub fn build_ui(app: &adw::Application, initial: Option<String>) {
     reclaim_hint.add_css_class("dim-label");
     reclaim_hint.add_css_class("caption");
 
+    // Batch-selection action bar — hidden until something is ticked.
+    let reclaim_select_label = gtk::Label::builder().xalign(0.0).hexpand(true).build();
+    reclaim_select_label.add_css_class("heading");
+    let select_all_safe = gtk::Button::with_label("Select all Safe");
+    select_all_safe.add_css_class("flat");
+    let reclaim_clear_button = gtk::Button::with_label("Move to Trash");
+    reclaim_clear_button.add_css_class("destructive-action");
+    let reclaim_select_bar = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    reclaim_select_bar.add_css_class("card");
+    reclaim_select_bar.set_margin_top(4);
+    reclaim_select_bar.set_margin_bottom(4);
+    {
+        // Inner padding for the card.
+        reclaim_select_bar.set_margin_start(0);
+    }
+    let select_bar_inner = gtk::Box::new(gtk::Orientation::Horizontal, 10);
+    select_bar_inner.set_margin_top(8);
+    select_bar_inner.set_margin_bottom(8);
+    select_bar_inner.set_margin_start(12);
+    select_bar_inner.set_margin_end(12);
+    select_bar_inner.set_hexpand(true);
+    select_bar_inner.append(&reclaim_select_label);
+    select_bar_inner.append(&select_all_safe);
+    select_bar_inner.append(&reclaim_clear_button);
+    reclaim_select_bar.append(&select_bar_inner);
+    reclaim_select_bar.set_visible(false);
+
     let reclaim_system_caption =
         gtk::Label::builder().xalign(0.0).label("Safe to clear").build();
     reclaim_system_caption.add_css_class("dim-label");
@@ -411,6 +508,7 @@ pub fn build_ui(app: &adw::Application, initial: Option<String>) {
     reclaim_inner.set_margin_end(12);
     reclaim_inner.append(&reclaim_top);
     reclaim_inner.append(&reclaim_hint);
+    reclaim_inner.append(&reclaim_select_bar);
     reclaim_inner.append(&reclaim_system_caption);
     reclaim_inner.append(&reclaim_system_list);
     reclaim_inner.append(&reclaim_artifact_caption);
@@ -436,6 +534,7 @@ pub fn build_ui(app: &adw::Application, initial: Option<String>) {
 
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
+    toolbar.add_top_bar(&search_bar);
     toolbar.set_content(Some(&toasts));
 
     let window = adw::ApplicationWindow::builder()
@@ -454,8 +553,11 @@ pub fn build_ui(app: &adw::Application, initial: Option<String>) {
         home_button: home_button.clone(),
         up_button: up_button.clone(),
         refresh_button: refresh_button.clone(),
+        search_button: search_button.clone(),
         current_scan: Rc::new(RefCell::new(None)),
         scan_gen: Rc::new(Cell::new(0)),
+        scan_detail,
+        scan_path,
         overview_total,
         capacity_ring,
         capacity_percent,
@@ -467,8 +569,12 @@ pub fn build_ui(app: &adw::Application, initial: Option<String>) {
         overview_data,
         crumbs,
         list: list.clone(),
+        search_paths: Rc::new(RefCell::new(Vec::new())),
         reclaim_total,
         reclaim_perm_switch: reclaim_perm_switch.clone(),
+        reclaim_select_bar,
+        reclaim_select_label,
+        reclaim_clear_button: reclaim_clear_button.clone(),
         reclaim_system_caption,
         reclaim_system_list: reclaim_system_list.clone(),
         reclaim_artifact_caption,
@@ -502,9 +608,66 @@ pub fn build_ui(app: &adw::Application, initial: Option<String>) {
         render(state, ui);
     });
     connect(&reclaim_button, &state, &ui, |state, ui| {
-        state.borrow_mut().view = View::Reclaim;
+        {
+            let mut s = state.borrow_mut();
+            s.reclaim_selected.clear(); // a fresh entry starts with nothing ticked
+            s.view = View::Reclaim;
+        }
         render(state, ui);
     });
+
+    // Search: entering search mode shows the results page; leaving it returns to
+    // the overview. Typing or changing the size filter re-runs the (instant,
+    // in-memory) search and repaints the results.
+    {
+        let state = state.clone();
+        let ui = ui.clone();
+        let entry = search_entry.clone();
+        search_bar.connect_search_mode_enabled_notify(move |bar| {
+            if state.borrow().root.is_none() {
+                return;
+            }
+            if bar.is_search_mode() {
+                state.borrow_mut().view = View::Search;
+            } else {
+                let mut s = state.borrow_mut();
+                s.search_query.clear();
+                s.view = View::Overview;
+                drop(s);
+                entry.set_text("");
+            }
+            render(&state, &ui);
+        });
+    }
+    {
+        let state = state.clone();
+        let ui = ui.clone();
+        let size_filter = size_filter.clone();
+        search_entry.connect_search_changed(move |entry| {
+            let mut s = state.borrow_mut();
+            if s.root.is_none() {
+                return;
+            }
+            s.search_query = entry.text().to_string();
+            s.search_min = size_threshold(size_filter.selected());
+            s.view = View::Search;
+            drop(s);
+            render(&state, &ui);
+        });
+    }
+    {
+        let state = state.clone();
+        let ui = ui.clone();
+        size_filter.connect_selected_notify(move |dd| {
+            let mut s = state.borrow_mut();
+            if !matches!(s.view, View::Search) {
+                return;
+            }
+            s.search_min = size_threshold(dd.selected());
+            drop(s);
+            render(&state, &ui);
+        });
+    }
 
     // Cancel button on the "Scanning…" page. If a folder scan is in flight, flip
     // its cancel flag — the worker returns `Interrupted` and its handler drops
@@ -533,6 +696,25 @@ pub fn build_ui(app: &adw::Application, initial: Option<String>) {
             populate_reclaim_lists(&state, &ui, perm);
         });
     }
+
+    // "Select all Safe": tick every entry whose blast radius is Safe, then rebuild
+    // the rows so the checkboxes reflect it.
+    connect(&select_all_safe, &state, &ui, |state, ui| {
+        {
+            let data = ui.reclaim_data.borrow();
+            let mut s = state.borrow_mut();
+            for r in data.0.iter().chain(data.1.iter()) {
+                if reclaim::consequence(r).risk == Risk::Safe {
+                    s.reclaim_selected.insert(r.path.clone());
+                }
+            }
+        }
+        let perm = state.borrow().reclaim_perm_delete;
+        populate_reclaim_lists(state, ui, perm);
+    });
+
+    // The batch clear button confirms once for everything selected, then clears.
+    connect(&reclaim_clear_button, &state, &ui, actions::confirm_and_clear_selected);
 
     // Overview category row → open that category.
     {
@@ -576,14 +758,44 @@ pub fn build_ui(app: &adw::Application, initial: Option<String>) {
                                 p
                             })
                     }
+                    // A directory search result jumps to that folder in the tree;
+                    // file results aren't activatable (act via hover/menu instead).
+                    (View::Search, Some(root)) => ui
+                        .search_paths
+                        .borrow()
+                        .get(index)
+                        .and_then(|target| locate(root, target))
+                        .filter(|p| folder_node(root, p).is_dir),
                     _ => None,
                 }
             };
             if let Some(path) = descend {
+                ui.search_button.set_active(false);
                 state.borrow_mut().view = View::Folder(path);
                 render(&state, &ui);
             }
         });
+    }
+
+    // Type-to-search from anywhere in the window, plus an explicit Ctrl+F that
+    // opens the search bar and focuses its entry.
+    search_bar.set_key_capture_widget(Some(&window));
+    {
+        let search_button = search_button.clone();
+        let search_entry = search_entry.clone();
+        let shortcut = gtk::Shortcut::new(
+            gtk::ShortcutTrigger::parse_string("<Control>f"),
+            Some(gtk::CallbackAction::new(move |_, _| {
+                if search_button.is_sensitive() {
+                    search_button.set_active(true);
+                    search_entry.grab_focus();
+                }
+                glib::Propagation::Stop
+            })),
+        );
+        let controller = gtk::ShortcutController::new();
+        controller.add_shortcut(shortcut);
+        window.add_controller(controller);
     }
 
     window.present();
@@ -598,6 +810,18 @@ pub fn build_ui(app: &adw::Application, initial: Option<String>) {
     }
 
     maybe_capture(&window, app);
+}
+
+/// Map the size-filter dropdown's selected index to a minimum-size threshold in
+/// bytes. Index 0 is "Any size" (no floor).
+fn size_threshold(index: u32) -> u64 {
+    match index {
+        1 => 1 << 20,   // 1 MB
+        2 => 10 << 20,  // 10 MB
+        3 => 100 << 20, // 100 MB
+        4 => 1 << 30,   // 1 GB
+        _ => 0,
+    }
 }
 
 /// A flat, icon-only header button.
@@ -787,7 +1011,8 @@ mod tests {
             file_count: 42,
             kind: ReclaimKind::Artifact,
         };
-        let row = reclaim_row(&item, false, &handler);
+        let on_select: Rc<dyn Fn(PathBuf, bool)> = Rc::new(|_, _| {});
+        let row = reclaim_row(&item, false, false, &handler, &on_select);
 
         WidgetExt::activate_action(&row, "row.trash", None).unwrap();
         assert_eq!(last.get(), Some(RowAction::Trash));

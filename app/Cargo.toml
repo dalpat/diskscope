@@ -13,7 +13,8 @@ path = "src/main.rs"
 # The pure core, aliased to `diskscope` so the UI does `use diskscope::...`.
 diskscope = { package = "diskscope-core", path = "../core" }
 gtk = { version = "0.9", package = "gtk4", features = ["v4_12"] }
-adw = { version = "0.7", package = "libadwaita", features = ["v1_5"] }
+# v1_6 for AdwSpinner (a GPU-cheap replacement for GtkSpinner) → libadwaita 1.6+.
+adw = { version = "0.7", package = "libadwaita", features = ["v1_6"] }
 async-channel = "2"
 
 [dev-dependencies]

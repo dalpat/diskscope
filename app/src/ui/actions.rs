@@ -13,10 +13,11 @@ use adw::prelude::*;
 use gtk::{gio, glib};
 
 use diskscope::format::human_size;
-use diskscope::reclaim::{self, ReclaimKind};
+use diskscope::reclaim::{self, Reclaimable, ReclaimKind};
+use diskscope::scan;
 
 use super::rows::files_phrase;
-use super::scanning::rescan_keeping_position;
+use super::views::{populate_reclaim_lists, render, update_reclaim_selection_bar};
 use super::{AppState, RowAction, Ui};
 
 /// Build the dispatcher for per-row actions (trailing buttons + context menu).
@@ -47,6 +48,131 @@ pub(super) fn reclaim_action_handler(state: &Rc<RefCell<AppState>>, ui: &Rc<Ui>)
         RowAction::Trash => confirm_clear(&path, false, &state, &ui),
         RowAction::Delete => confirm_clear(&path, true, &state, &ui),
     })
+}
+
+/// Build the handler a reclaim row's checkbox calls when toggled: add or remove
+/// the entry's path from the selection, then refresh the batch-selection bar.
+pub(super) fn reclaim_select_handler(
+    state: &Rc<RefCell<AppState>>,
+    ui: &Rc<Ui>,
+) -> Rc<dyn Fn(PathBuf, bool)> {
+    let state = state.clone();
+    let ui = ui.clone();
+    Rc::new(move |path, selected| {
+        {
+            let mut s = state.borrow_mut();
+            if selected {
+                s.reclaim_selected.insert(path);
+            } else {
+                s.reclaim_selected.remove(&path);
+            }
+        }
+        update_reclaim_selection_bar(&state, &ui);
+    })
+}
+
+/// Confirm clearing everything currently ticked in the Reclaim view in one
+/// reviewed action, then remove each — patching the tree and measured data in
+/// place (no rescan). Each item still uses its own removal mode: the Trash is
+/// always emptied permanently, others honour the delete-mode switch.
+pub(super) fn confirm_and_clear_selected(state: &Rc<RefCell<AppState>>, ui: &Rc<Ui>) {
+    let perm = state.borrow().reclaim_perm_delete;
+    let items: Vec<Reclaimable> = {
+        let s = state.borrow();
+        let data = ui.reclaim_data.borrow();
+        data.0
+            .iter()
+            .chain(data.1.iter())
+            .filter(|r| s.reclaim_selected.contains(&r.path))
+            .cloned()
+            .collect()
+    };
+    if items.is_empty() {
+        return;
+    }
+
+    let count = items.len();
+    let bytes: u64 = items.iter().map(|r| r.size).sum();
+    let mut listing: String = items
+        .iter()
+        .take(8)
+        .map(|r| format!("• {} — {}", r.label, human_size(r.size)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if count > 8 {
+        listing.push_str(&format!("\n• …and {} more", count - 8));
+    }
+    let reversibility = if perm {
+        "Permanently deletes the selected items now — this cannot be undone."
+    } else {
+        "Selected items move to Trash (reversible); the Trash itself is emptied for good."
+    };
+    let heading = format!("Clear {count} selected item{}?", if count == 1 { "" } else { "s" });
+    let body = format!("Frees {} in total.\n\n{listing}\n\n{reversibility}", human_size(bytes));
+
+    let dialog = adw::AlertDialog::new(Some(&heading), Some(&body));
+    let confirm_label = if perm { "Delete All" } else { "Move All to Trash" };
+    dialog.add_responses(&[("cancel", "Cancel"), ("go", confirm_label)]);
+    dialog.set_response_appearance("go", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    let window = ui.window.clone();
+    let state = state.clone();
+    let ui = ui.clone();
+    dialog.choose(&window, gio::Cancellable::NONE, move |response| {
+        if response != "go" {
+            return;
+        }
+        let (mut freed, mut failed) = (0u64, 0u32);
+        for item in &items {
+            let permanent = perm || item.kind == ReclaimKind::Trash;
+            let result = if permanent {
+                delete_path(&item.path)
+            } else {
+                gio::File::for_path(&item.path)
+                    .trash(gio::Cancellable::NONE)
+                    .map_err(|e| std::io::Error::other(e.message().to_string()))
+            };
+            match result {
+                Ok(()) => {
+                    freed += item.size;
+                    if let Some(root) = state.borrow_mut().root.as_mut() {
+                        scan::remove(root, &item.path);
+                    }
+                    let mut data = ui.reclaim_data.borrow_mut();
+                    data.0.retain(|r| r.path != item.path);
+                    data.1.retain(|r| r.path != item.path);
+                }
+                Err(_) => failed += 1,
+            }
+        }
+        state.borrow_mut().reclaim_selected.clear();
+        let perm_now = state.borrow().reclaim_perm_delete;
+        populate_reclaim_lists(&state, &ui, perm_now);
+
+        let message = if failed == 0 {
+            format!("Cleared {count} — {} freed", human_size(freed))
+        } else {
+            format!("Cleared {} — {} freed; {failed} couldn't be removed", count - failed as usize, human_size(freed))
+        };
+        ui.toasts.add_toast(adw::Toast::new(&message));
+    });
+}
+
+/// Patch the in-memory tree to drop `path`, then re-render the current view —
+/// the instant alternative to a full rescan after a delete or trash. The bytes
+/// are already gone from disk (or moved to Trash), so fixing up the cached tree
+/// keeps the view correct without re-walking it. A `path` outside the scanned
+/// root is simply a no-op.
+fn prune_and_render(path: &Path, state: &Rc<RefCell<AppState>>, ui: &Rc<Ui>) {
+    {
+        let mut s = state.borrow_mut();
+        if let Some(root) = s.root.as_mut() {
+            scan::remove(root, path);
+        }
+    }
+    render(state, ui);
 }
 
 /// Show the blast radius for clearing `path`, then (on confirm) clear it.
@@ -118,7 +244,22 @@ fn confirm_clear(path: &Path, perm: bool, state: &Rc<RefCell<AppState>>, ui: &Rc
                 } else {
                     "Moved to Trash"
                 }));
-                rescan_keeping_position(&state, &ui);
+                // Patch the tree and the already-measured reclaim data in place:
+                // the cleared row drops out instantly, with no full rescan and no
+                // re-measuring of the caches/Trash behind the spinner.
+                {
+                    let mut s = state.borrow_mut();
+                    if let Some(root) = s.root.as_mut() {
+                        scan::remove(root, &path);
+                    }
+                }
+                {
+                    let mut data = ui.reclaim_data.borrow_mut();
+                    data.0.retain(|r| r.path != path);
+                    data.1.retain(|r| r.path != path);
+                }
+                let perm_mode = state.borrow().reclaim_perm_delete;
+                populate_reclaim_lists(&state, &ui, perm_mode);
             }
             Err(err) => {
                 ui.toasts.add_toast(adw::Toast::new(&format!("Couldn't clear: {err}")));
@@ -285,7 +426,7 @@ fn confirm_and_trash(path: PathBuf, state: &Rc<RefCell<AppState>>, ui: &Rc<Ui>) 
             match gio::File::for_path(&path).trash(gio::Cancellable::NONE) {
                 Ok(()) => {
                     ui.toasts.add_toast(adw::Toast::new("Moved to Trash"));
-                    rescan_keeping_position(&state, &ui);
+                    prune_and_render(&path, &state, &ui);
                 }
                 Err(err) => {
                     ui.toasts.add_toast(adw::Toast::new(&format!("Couldn't move to Trash: {err}")));
@@ -323,7 +464,7 @@ fn confirm_and_delete(path: PathBuf, state: &Rc<RefCell<AppState>>, ui: &Rc<Ui>)
             match delete_path(&path) {
                 Ok(()) => {
                     ui.toasts.add_toast(adw::Toast::new("Deleted — space freed"));
-                    rescan_keeping_position(&state, &ui);
+                    prune_and_render(&path, &state, &ui);
                 }
                 Err(err) => {
                     ui.toasts.add_toast(adw::Toast::new(&format!("Couldn't delete: {err}")));

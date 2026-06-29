@@ -7,11 +7,14 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
 
 use adw::prelude::*;
 use gtk::{gio, glib};
 
-use diskscope::scan::{self, CancelFlag, Node};
+use diskscope::format::{human_size, thousands};
+use diskscope::scan::{self, CancelFlag, Node, ScanProgress};
 
 use super::views::render;
 use super::{AppState, Restore, Ui, View};
@@ -63,10 +66,17 @@ fn scan_into(root_path: PathBuf, restore: Restore, state: &Rc<RefCell<AppState>>
     let generation = ui.scan_gen.get().wrapping_add(1);
     ui.scan_gen.set(generation);
 
+    // Reset the heartbeat readouts, then poll the shared progress counters on a
+    // timer until this scan settles (or is superseded by a newer one).
+    ui.scan_detail.set_text("Starting…");
+    ui.scan_path.set_text("");
+    let progress = Arc::new(ScanProgress::new());
+    start_progress_timer(progress.clone(), generation, ui);
+
     let (sender, receiver) = async_channel::bounded(1);
     let scan_path = root_path.clone();
     std::thread::spawn(move || {
-        let _ = sender.send_blocking(scan::scan_cancellable(&scan_path, &cancel));
+        let _ = sender.send_blocking(scan::scan_reporting(&scan_path, &cancel, &progress));
     });
 
     let state = state.clone();
@@ -110,6 +120,27 @@ fn scan_into(root_path: PathBuf, restore: Restore, state: &Rc<RefCell<AppState>>
                 ui.toasts.add_toast(adw::Toast::new(&message));
             }
         }
+    });
+}
+
+/// Poll `progress` on a timer and paint the scanning page's live readouts until
+/// this scan (`generation`) settles or a newer one supersedes it.
+///
+/// The timer stops itself once `current_scan` is cleared (the result has landed)
+/// or the generation moves on, so it never outlives the scan it reports on.
+fn start_progress_timer(progress: Arc<ScanProgress>, generation: u64, ui: &Rc<Ui>) {
+    let ui = ui.clone();
+    glib::timeout_add_local(Duration::from_millis(120), move || {
+        if ui.scan_gen.get() != generation || ui.current_scan.borrow().is_none() {
+            return glib::ControlFlow::Break;
+        }
+        let (bytes, items) = (progress.bytes(), progress.items());
+        ui.scan_detail.set_text(&format!("{} · {} items", human_size(bytes), thousands(items)));
+        let current = progress.current();
+        if !current.as_os_str().is_empty() {
+            ui.scan_path.set_text(&current.display().to_string());
+        }
+        glib::ControlFlow::Continue
     });
 }
 
